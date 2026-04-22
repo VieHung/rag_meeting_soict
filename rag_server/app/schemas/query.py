@@ -4,6 +4,7 @@ from typing import List, Optional
 
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Câu hỏi / query của người dùng")
+    collection: Optional[str] = Field(None, description="Collection name (mặc định: documents)")
     top_k: int = Field(5, ge=1, le=50, description="Số kết quả trả về")
     source_filter: Optional[str] = Field(None, description="Lọc kết quả theo tên file nguồn")
     score_threshold: float = Field(0.0, ge=0.0, le=1.0, description="Ngưỡng similarity tối thiểu")

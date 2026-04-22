@@ -9,19 +9,19 @@ import uuid
 
 
 class QdrantService:
-    _instance = None
+    _client = None
+    _collections_created = set()
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._client = QdrantClient(
+    def __init__(self, collection_name: str = None):
+        if QdrantService._client is None:
+            QdrantService._client = QdrantClient(
                 host=settings.qdrant_host,
                 port=settings.qdrant_port,
                 timeout=30,
             )
-            cls._instance._collection = settings.qdrant_collection_name
-            cls._instance._ensure_collection()
-        return cls._instance
+        self._collection = collection_name or settings.qdrant_collection_name
+        if self._collection not in QdrantService._collections_created:
+            self._ensure_collection()
 
     def _ensure_collection(self):
         existing = [c.name for c in self._client.get_collections().collections]
@@ -38,6 +38,7 @@ class QdrantService:
                 field_name="source",
                 field_schema="keyword",
             )
+            QdrantService._collections_created.add(self._collection)
             print(f"Created Qdrant collection: '{self._collection}'")
 
     def upsert_chunks(
@@ -118,6 +119,37 @@ class QdrantService:
         )
         return result.operation_id
 
+    def delete_by_doc_id(self, doc_id: str) -> int:
+        result = self._client.delete(
+            collection_name=self._collection,
+            points_selector=Filter(
+                must=[FieldCondition(
+                    key="doc_id",
+                    match=MatchValue(value=doc_id),
+                )]
+            ),
+        )
+        return result.operation_id
+
+    def list_documents(self) -> List[Dict[str, Any]]:
+        points, _ = self._client.scroll(
+            collection_name=self._collection,
+            scroll_filter=None,
+            with_payload=True,
+            limit=1000,
+        )
+        docs = {}
+        for point in points:
+            doc_id = point.payload.get("doc_id", "")
+            if doc_id and doc_id not in docs:
+                docs[doc_id] = {
+                    "doc_id": doc_id,
+                    "source": point.payload.get("source", ""),
+                    "chunks": point.payload.get("chunk_total", 0),
+                    "chunk_index": point.payload.get("chunk_index", 0),
+                }
+        return list(docs.values())
+
     def collection_info(self) -> Dict[str, Any]:
         info = self._client.get_collection(self._collection)
         return {
@@ -128,3 +160,60 @@ class QdrantService:
             "vector_size": info.config.params.vectors.size,
             "distance": str(info.config.params.vectors.distance),
         }
+
+    @classmethod
+    def list_collections(cls) -> List[str]:
+        if cls._client is None:
+            cls._client = QdrantClient(
+                host=settings.qdrant_host,
+                port=settings.qdrant_port,
+                timeout=30,
+            )
+        return [c.name for c in cls._client.get_collections().collections]
+
+    @classmethod
+    def create_collection(cls, name: str) -> dict:
+        try:
+            if cls._client is None:
+                cls._client = QdrantClient(
+                    host=settings.qdrant_host,
+                    port=settings.qdrant_port,
+                    timeout=30,
+                )
+            existing = [c.name for c in cls._client.get_collections().collections]
+            if name in existing:
+                return {"success": False, "message": f"Collection '{name}' already exists"}
+            cls._client.create_collection(
+                collection_name=name,
+                vectors_config=VectorParams(
+                    size=settings.embedding_dim,
+                    distance=Distance.COSINE,
+                ),
+            )
+            cls._client.create_payload_index(
+                collection_name=name,
+                field_name="source",
+                field_schema="keyword",
+            )
+            cls._collections_created.add(name)
+            return {"success": True, "message": f"Created collection '{name}'"}
+        except Exception as e:
+            return {"success": False, "message": f"Error: {str(e)}"}
+
+    @classmethod
+    def delete_collection(cls, name: str) -> dict:
+        try:
+            if cls._client is None:
+                cls._client = QdrantClient(
+                    host=settings.qdrant_host,
+                    port=settings.qdrant_port,
+                    timeout=30,
+                )
+            existing = [c.name for c in cls._client.get_collections().collections]
+            if name not in existing:
+                return {"success": False, "message": f"Collection '{name}' not found"}
+            cls._client.delete_collection(collection_name=name)
+            cls._collections_created.discard(name)
+            return {"success": True, "message": f"Deleted collection '{name}'"}
+        except Exception as e:
+            return {"success": False, "message": f"Error: {str(e)}"}

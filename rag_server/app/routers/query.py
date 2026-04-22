@@ -19,11 +19,11 @@ def get_qdrant() -> QdrantService:
 async def query_documents(
     request: QueryRequest,
     embedder: EmbeddingService = Depends(get_embedder),
-    qdrant: QdrantService = Depends(get_qdrant),
 ):
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query không được rỗng")
 
+    qdrant = QdrantService(request.collection)
     query_vector = embedder.embed_query(request.query)
 
     raw_results = qdrant.search(

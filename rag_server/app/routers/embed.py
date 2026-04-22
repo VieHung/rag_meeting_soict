@@ -27,10 +27,11 @@ def get_qdrant() -> QdrantService:
 async def embed_file(
     file: UploadFile = File(..., description="File tài liệu: .txt, .pdf, .docx, .md"),
     doc_id: Optional[str] = Form(None, description="UUID tùy chỉnh (optional)"),
+    collection: Optional[str] = Form(None, description="Collection name (mặc định: documents)"),
     extra_metadata: Optional[str] = Form(None, description="JSON string metadata tùy chỉnh"),
     embedder: EmbeddingService = Depends(get_embedder),
-    qdrant: QdrantService = Depends(get_qdrant),
 ):
+    qdrant = QdrantService(collection)
     file_bytes = await file.read()
     if len(file_bytes) == 0:
         raise HTTPException(status_code=400, detail="File rỗng")
@@ -83,8 +84,8 @@ async def embed_file(
 async def embed_text(
     request: EmbedTextRequest,
     embedder: EmbeddingService = Depends(get_embedder),
-    qdrant: QdrantService = Depends(get_qdrant),
 ):
+    qdrant = QdrantService(request.collection)
     _doc_id = request.doc_id or str(uuid.uuid4())
 
     chunks = chunk_text(
@@ -110,15 +111,37 @@ async def embed_text(
     )
 
 
-@router.delete("/{source}", summary="Xóa tài liệu đã index")
-async def delete_document(
-    source: str,
-    qdrant: QdrantService = Depends(get_qdrant),
-):
+@router.delete("/{collection}/source/{source}", summary="Xóa tài liệu theo source")
+async def delete_document(collection: str, source: str):
+    qdrant = QdrantService(collection)
     qdrant.delete_by_source(source)
     return {"success": True, "message": f"Đã xóa tài liệu '{source}'"}
 
 
-@router.get("/info", summary="Thông tin collection")
-async def collection_info(qdrant: QdrantService = Depends(get_qdrant)):
-    return qdrant.collection_info()
+@router.delete("/{collection}/doc/{doc_id}", summary="Xóa tài liệu theo doc_id (UUID)")
+async def delete_document_by_id(collection: str, doc_id: str):
+    qdrant = QdrantService(collection)
+    qdrant.delete_by_doc_id(doc_id)
+    return {"success": True, "message": f"Đã xóa tài liệu có doc_id '{doc_id}'"}
+
+
+@router.get("/{collection}/documents", summary="Liệt kê tài liệu trong collection")
+async def list_documents(collection: str):
+    qdrant = QdrantService(collection)
+    docs = qdrant.list_documents()
+    return {"documents": docs, "total": len(docs)}
+
+
+@router.get("/collections", summary="Liệt kê tất cả collections")
+async def list_collections():
+    return {"collections": QdrantService.list_collections()}
+
+
+@router.post("/collections", summary="Tạo collection mới")
+async def create_collection(name: str = Form(..., description="Collection name")):
+    return QdrantService.create_collection(name)
+
+
+@router.delete("/collections", summary="Xóa collection")
+async def delete_collection(name: str = Form(..., description="Collection name")):
+    return QdrantService.delete_collection(name)
