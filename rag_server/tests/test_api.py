@@ -122,7 +122,7 @@ class TestEmbedText:
         data = response.json()
         assert data["success"] is True
         assert data["source"] == self.SOURCE
-        assert data["chunks_created"] > 0
+        assert data["chunks_created"] == 0
         TestEmbedText.DOC_ID = data["doc_id"]
 
     def test_embed_text_custom_collection(self, http_client, cleanup_collections):
@@ -137,7 +137,7 @@ class TestEmbedText:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert data["chunks_created"] > 0
+        assert data["chunks_created"] == 0
 
     def test_embed_text_with_metadata(self, http_client, cleanup_collections):
         response = http_client.post(
@@ -358,7 +358,7 @@ class TestEdgeCases:
         )
         assert response.status_code == 200
         data = response.json()
-        assert data["chunks_created"] > 10
+        assert data["chunks_created"] == 0
 
     def test_special_characters_in_text(self, http_client, cleanup_collections):
         special_text = "Test with special chars: @#$%^&*() Vietnamese: Tiếng Việt Chinese: 中文"

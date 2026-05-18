@@ -1,6 +1,6 @@
 import uuid
 import json
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
 from typing import Optional
 from app.schemas.embed import EmbedResponse, EmbedTextRequest
 from app.services.embedding import EmbeddingService
@@ -15,41 +15,84 @@ router = APIRouter(prefix="/embed", tags=["Embedding"])
 parser = DocumentParser()
 
 
-def get_embedder() -> EmbeddingService:
-    return EmbeddingService()
+def _embed_file_background(
+    file_bytes: bytes,
+    filename: str,
+    content_type: str,
+    collection: Optional[str],
+    doc_id: str,
+    extra_metadata: dict,
+):
+    try:
+        qdrant = QdrantService(collection)
+        text = parser.parse(file_bytes, filename, content_type or "")
+        if not text.strip():
+            print(f"Skip embedding: empty parsed text for file '{filename}'")
+            return
+
+        chunks = chunk_text(text, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
+        if not chunks:
+            print(f"Skip embedding: no chunks generated for file '{filename}'")
+            return
+
+        vectors = EmbeddingService().embed_texts(chunks)
+        metadata = {
+            "source": filename,
+            "doc_id": doc_id,
+            "file_size": len(file_bytes),
+            "mime_type": content_type,
+            **extra_metadata,
+        }
+        count = qdrant.upsert_chunks(chunks, vectors, metadata)
+        print(f"Background embedded {count} chunks from file '{filename}'")
+    except Exception as e:
+        print(f"Background embedding failed for file '{filename}': {str(e)}")
 
 
-def get_qdrant() -> QdrantService:
-    return QdrantService()
+def _embed_text_background(
+    text: str,
+    source: str,
+    collection: Optional[str],
+    doc_id: str,
+    metadata: dict,
+):
+    try:
+        qdrant = QdrantService(collection)
+        chunks = chunk_text(
+            text,
+            chunk_size=settings.chunk_size,
+            overlap=settings.chunk_overlap,
+        )
+        if not chunks:
+            print(f"Skip embedding: no chunks generated for source '{source}'")
+            return
+
+        vectors = EmbeddingService().embed_texts(chunks)
+        payload_metadata = {
+            "source": source,
+            "doc_id": doc_id,
+            **(metadata or {}),
+        }
+        count = qdrant.upsert_chunks(chunks, vectors, payload_metadata)
+        print(f"Background embedded {count} chunks from source '{source}'")
+    except Exception as e:
+        print(f"Background embedding failed for source '{source}': {str(e)}")
 
 
 @router.post("/file", response_model=EmbedResponse, summary="Upload và embed tài liệu")
 async def embed_file(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="File tài liệu: .txt, .pdf, .docx, .md"),
     doc_id: Optional[str] = Form(None, description="UUID tùy chỉnh (optional)"),
     collection: Optional[str] = Form(None, description="Collection name (mặc định: documents)"),
     extra_metadata: Optional[str] = Form(None, description="JSON string metadata tùy chỉnh"),
-    embedder: EmbeddingService = Depends(get_embedder),
 ):
-    qdrant = QdrantService(collection)
     file_bytes = await file.read()
     if len(file_bytes) == 0:
         raise HTTPException(status_code=400, detail="File rỗng")
 
     if len(file_bytes) > 50 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File quá lớn (tối đa 50MB)")
-
-    try:
-        text = parser.parse(file_bytes, file.filename, file.content_type or "")
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    if not text.strip():
-        raise HTTPException(status_code=422, detail="Không extract được text từ file")
-
-    chunks = chunk_text(text, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
-    if not chunks:
-        raise HTTPException(status_code=422, detail="Không tạo được chunks từ text")
 
     _doc_id = doc_id or str(uuid.uuid4())
 
@@ -60,54 +103,47 @@ async def embed_file(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="extra_metadata không phải JSON hợp lệ")
 
-    vectors = embedder.embed_texts(chunks)
-
-    metadata = {
-        "source": file.filename,
-        "doc_id": _doc_id,
-        "file_size": len(file_bytes),
-        "mime_type": file.content_type,
-        **_extra,
-    }
-    count = qdrant.upsert_chunks(chunks, vectors, metadata)
+    background_tasks.add_task(
+        _embed_file_background,
+        file_bytes=file_bytes,
+        filename=file.filename,
+        content_type=file.content_type,
+        collection=collection,
+        doc_id=_doc_id,
+        extra_metadata=_extra,
+    )
 
     return EmbedResponse(
         success=True,
         doc_id=_doc_id,
         source=file.filename,
-        chunks_created=count,
-        message=f"Đã embed {count} chunks từ '{file.filename}'",
+        chunks_created=0,
+        message=f"Đã nhận file '{file.filename}', embedding sẽ chạy nền ngay sau response",
     )
 
 
 @router.post("/text", response_model=EmbedResponse, summary="Embed plain text")
 async def embed_text(
     request: EmbedTextRequest,
-    embedder: EmbeddingService = Depends(get_embedder),
+    background_tasks: BackgroundTasks,
 ):
-    qdrant = QdrantService(request.collection)
     _doc_id = request.doc_id or str(uuid.uuid4())
 
-    chunks = chunk_text(
-        request.text,
-        chunk_size=settings.chunk_size,
-        overlap=settings.chunk_overlap,
+    background_tasks.add_task(
+        _embed_text_background,
+        text=request.text,
+        source=request.source,
+        collection=request.collection,
+        doc_id=_doc_id,
+        metadata=request.metadata or {},
     )
-
-    vectors = embedder.embed_texts(chunks)
-    metadata = {
-        "source": request.source,
-        "doc_id": _doc_id,
-        **(request.metadata or {}),
-    }
-    count = qdrant.upsert_chunks(chunks, vectors, metadata)
 
     return EmbedResponse(
         success=True,
         doc_id=_doc_id,
         source=request.source,
-        chunks_created=count,
-        message=f"Đã embed {count} chunks từ source '{request.source}'",
+        chunks_created=0,
+        message=f"Đã nhận source '{request.source}', embedding sẽ chạy nền ngay sau response",
     )
 
 
