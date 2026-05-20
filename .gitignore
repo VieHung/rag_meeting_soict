@@ -1,2 +1,42 @@
+# === Environment ===
+rag_server/.env
+.env
+*.env.local
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# === Virtual environment ===
+venv/
+.venv/
+
+# === Cache & temp ===
+.pytest_cache/
+*.log
+.ruff_cache/
+.mypy_cache/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Data (Docker volumes) ===
+rag_server/qdrant_storage/
+rag_server/redis_data/
+rag_server/ollama_data/
+
+# === OS ===
+.DS_Store
+Thumbs.db
+
+# === Design docs (no longer in use) ===
 plan.md
 rag_server/STATE.md
+
+test_api_lmstudio.py

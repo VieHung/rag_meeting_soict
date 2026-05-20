@@ -291,3 +291,34 @@ class TranscriptStore:
             return self._collection in existing
         except Exception:
             return False
+
+    def get_max_sequence_id(self) -> Optional[int]:
+        """Lấy sequence_id lớn nhất trong collection (dùng để rebuild counter)."""
+        try:
+            flt = Filter(
+                must=[
+                    FieldCondition(
+                        key="sequence_id",
+                        range=Range(gte=1),
+                    ),
+                ]
+            )
+            points, _ = self.client.scroll(
+                collection_name=self._collection,
+                scroll_filter=flt,
+                with_payload=True,
+                with_vectors=False,
+                limit=100,
+            )
+            if not points:
+                return None
+            max_seq = 0
+            for p in points:
+                seq = p.payload.get("sequence_id") if p.payload else None
+                if seq is not None:
+                    seq_int = int(seq)
+                    if seq_int > max_seq:
+                        max_seq = seq_int
+            return max_seq if max_seq > 0 else None
+        except Exception:
+            return None

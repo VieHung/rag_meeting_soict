@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.schemas.query import QueryRequest, QueryResponse, QueryResult
@@ -56,7 +58,23 @@ async def query_documents(
     )
 
 
-# ---- Phase 2: query transcript ----------------------------------------------
+# ---- Phase 2: query transcript -----------------------------------------------
+
+MEETING_PREFIX = "meeting-"
+
+
+class InvalidCollectionPrefix(Exception):
+    pass
+
+
+def _validate_meeting_collection(collection: Optional[str]) -> str:
+    if collection is None:
+        raise InvalidCollectionPrefix("collection is required for transcript query")
+    if not collection.startswith(MEETING_PREFIX):
+        raise InvalidCollectionPrefix(
+            f"collection must start with '{MEETING_PREFIX}' for transcript query"
+        )
+    return collection
 
 
 @router.post(
@@ -68,6 +86,11 @@ async def query_transcript(
     request: TranscriptQueryRequest,
     service: TranscriptService = Depends(get_transcript_service),
 ):
+    try:
+        _validate_meeting_collection(request.collection)
+    except InvalidCollectionPrefix as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     try:
         return await service.query_transcript(request)
     except ValueError as e:

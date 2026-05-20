@@ -20,12 +20,15 @@ class Settings(BaseSettings):
     redis_port: int = 6379
     redis_db: int = 0
     redis_password: Optional[str] = None
+    seq_key_ttl_seconds: int = 604800  # 7 days
 
     # === Transcript ===
     transcript_seq_start: int = 1
     transcript_window_size: int = 2
     transcript_max_window_size: int = 5
-    transcript_default_collection: str = "meeting_transcripts"
+    transcript_default_collection: str = "default"
+    transcript_collection_prefix: str = "meeting-"
+    docs_collection_prefix: str = "docs-"
 
     # === Context Builder LLM ===
     llm_provider: str = "ollama"          # ollama | gemini | openai | none

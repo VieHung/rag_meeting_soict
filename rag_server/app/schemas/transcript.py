@@ -1,6 +1,9 @@
-"""Pydantic schemas for transcript flow (Phase 2).
+"""Pydantic schemas for transcript flow (Phase 2) - Bản v2.
 
-Tách khỏi schemas/embed.py & schemas/query.py để không động luồng tài liệu cũ.
+Theo phase2plan_v2.md:
+- meeting_id được suy ra từ tên collection (prefix meeting-)
+- Context lưu trong metadata của vector (không Redis)
+- Endpoint gọp: context latest + by sequence_id -> /context?sequence_id=
 """
 from __future__ import annotations
 
@@ -10,27 +13,9 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-# ----------------------------- Meeting init ----------------------------------
-
-class MeetingInitRequest(BaseModel):
-    meeting_id: str = Field(..., min_length=1, description="ID cuộc họp duy nhất")
-    force_reset: bool = Field(
-        False,
-        description="Nếu True, reset counter & metadata khi meeting đã tồn tại",
-    )
-
-
-class MeetingInitResponse(BaseModel):
-    meeting_id: str
-    collection: str
-    status: Literal["initialized", "reset"]
-    seq_counter: int = Field(0, description="Giá trị counter sau khi init")
-
-
 # ----------------------------- Transcript embed ------------------------------
 
 class TranscriptEmbedRequest(BaseModel):
-    meeting_id: str = Field(..., min_length=1)
     speaker: str = Field(..., min_length=1, description="Tên người nói")
     speaker_id: Optional[str] = Field(None, description="ID định danh (optional)")
     text: str = Field(..., min_length=1, description="Nội dung câu transcript")
@@ -41,7 +26,7 @@ class TranscriptEmbedRequest(BaseModel):
     lang: Optional[str] = Field(None, description="Mã ngôn ngữ phát hiện (vi, en...)")
 
 
-ContextStatus = Literal["pending", "processing", "ready", "failed"]
+ContextStatus = Literal["pending", "processing", "ready", "failed", "disabled"]
 
 
 class TranscriptEmbedResponse(BaseModel):

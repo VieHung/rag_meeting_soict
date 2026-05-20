@@ -498,157 +498,138 @@ pytest tests/test_api.py::TestQuery::test_query_basic -v
 
 ## Phase 2 — Transcript cuộc họp (BKMEETING)
 
-Phase 2 bổ sung luồng RAG riêng cho **transcript của cuộc họp**. Tách hoàn toàn với luồng tài liệu Phase 1: hai collection Qdrant khác nhau, hai endpoint query khác nhau. Xem `plan.md` ở repo root để biết design rationale.
+Phase 2 bổ sung luồng RAG riêng cho **transcript của cuộc họp**, theo thiết kế v2 (xem `phase2plan_v2.md`).
 
-### Khái niệm
+### Kiến trúc 2 tầng
 
-- Mỗi câu transcript = **đúng 1 vector** (không chunking).
-- Server tự gán `sequence_id` (atomic INCR trên Redis) → đảm bảo liên tục, không trùng.
-- Context (tóm tắt cuộc họp tính tới câu N) được build **nền** bằng một LLM (Ollama / Gemini / OpenAI). Có thể tắt bằng `LLM_PROVIDER=none`.
-- Khi query, kết quả trả kèm **window ±N câu lân cận** + context.
+| Tầng | Phần cứng | Vai trò |
+|------|-----------|---------|
+| **Thiết bị (client)** | Qualcomm QCS8550 | AI on-device: live transcript, LLM nhỏ sinh câu trả lời |
+| **Server (cái này)** | Server độc lập, mạnh | RAG API + Qdrant + Redis + LLM self-host build context |
 
-### Hạ tầng cần thêm
+### Quy ước Collection
 
-- **Redis** — sequence counter + context cache. Đã thêm sẵn vào `docker-compose.yml`.
-- **LLM** — optional. Có thể dùng Ollama local (profile `ollama` trong compose) hoặc API ngoài (Gemini/OpenAI).
+Mỗi cuộc họp = một **cặp collection** (do app tạo thủ công, phân biệt bằng tiền tố):
 
-### Endpoints mới
+| Loại | Tiền tố | Ví dụ | Endpoint |
+|------|---------|-------|----------|
+| Transcript | `meeting-{uuid}` | `meeting-c7cfdf57-...` | `/transcript/*`, `/query/transcript` |
+| Tài liệu | `docs-{uuid}` | `docs-c7cfdf57-...` | `/embed/*`, `/query/` |
 
-| Method | Endpoint | Mô tả |
-|--------|----------|-------|
-| `POST` | `/transcript/{collection}/meeting/init` | Khởi tạo cuộc họp (reset counter) |
-| `DELETE` | `/transcript/{collection}/meeting/{meeting_id}` | Xoá toàn bộ transcript + state Redis |
-| `POST` | `/transcript/{collection}/embed` | Lưu 1 câu transcript, trả `sequence_id` ngay (`202 Accepted`) |
-| `GET` | `/transcript/{collection}/context/latest?meeting_id=...` | Context mới nhất |
-| `GET` | `/transcript/{collection}/context/{sequence_id}?meeting_id=...` | Context tại 1 thời điểm |
-| `PATCH` | `/transcript/{collection}/context/{sequence_id}` | LLM nội bộ update context |
-| `GET` | `/transcript/{collection}/meeting/{meeting_id}/segments` | Liệt kê transcript theo range |
-| `POST` | `/query/transcript` | Query transcript (kèm window) |
+`meeting_id` được **suy ra từ tên collection** (bỏ tiền tố `meeting-`), client không cần gửi.
 
-### Workflow ví dụ
+### Endpoints (4 endpoints, đã rút gọn từ 8)
+
+| # | Method | Endpoint | Bắt buộc | Mô tả |
+|---|--------|----------|----------|-------|
+| 1 | `POST` | `/transcript/{collection}/embed` | ✅ Core | Lưu 1 câu transcript, server gán `sequence_id`, trigger build context nền |
+| 2 | `POST` | `/query/transcript` | ✅ Core | Truy vấn ngữ nghĩa transcript, trả kết quả kèm **window** + **context** |
+| 3 | `GET` | `/transcript/{collection}/context` | ⬜ Optional | Lấy context (tóm tắt) mới nhất; hỗ trợ `?sequence_id=` |
+| 4 | `GET` | `/transcript/{collection}/segments` | ⬜ Optional | Liệt kê transcript theo khoảng `sequence_id` |
+
+### Workflow
+
+Collection naming: `meeting-{uuid}` (ví dụ: `meeting-abc123`).
 
 ```bash
-COL=meeting_transcripts
-MID=meeting_2026_soict_001
-
-# 1. Init cuộc họp
-curl -X POST http://localhost:8000/transcript/$COL/meeting/init \
+# 1. Embed từng câu (server tự sinh sequence_id, build context nền)
+curl -X POST http://localhost:8000/transcript/meeting-abc123/embed \
   -H "Content-Type: application/json" \
-  -d "{\"meeting_id\": \"$MID\"}"
-
-# 2. Embed từng câu (server gán sequence_id)
-curl -X POST http://localhost:8000/transcript/$COL/embed \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"meeting_id\": \"$MID\",
-    \"speaker\": \"Đoàn Sỹ Nguyên\",
-    \"text\": \"Chúng ta cần xem lại ngân sách Q4 trước khi chốt.\"
-  }"
+  -d '{
+    "speaker": "Đoàn Sỹ Nguyên",
+    "text": "Chúng ta cần xem lại ngân sách Q4 trước khi chốt."
+  }'
 # → 202 { "sequence_id": 1, "point_id": "...", "context_status": "pending" }
 
-# 3. Query có window
+curl -X POST http://localhost:8000/transcript/meeting-abc123/embed \
+  -H "Content-Type: application/json" \
+  -d '{
+    "speaker": "Mai Xuân Ngọc",
+    "text": "Tôi đề xuất cắt 15% chi phí vận hành."
+  }'
+# → 202 { "sequence_id": 2, "context_status": "pending" }
+
+# Đợi 5-10s cho context worker hoàn thành...
+
+# 2. Query transcript (kèm window ±N câu + context)
 curl -X POST http://localhost:8000/query/transcript \
   -H "Content-Type: application/json" \
-  -d "{
-    \"collection\": \"$COL\",
-    \"query\": \"Quyết định về ngân sách Q4 là gì?\",
-    \"meeting_id\": \"$MID\",
-    \"top_k\": 3,
-    \"window_size\": 2
-  }"
+  -d '{
+    "collection": "meeting-abc123",
+    "query": "Quyết định về ngân sách Q4 là gì?",
+    "top_k": 3,
+    "window_size": 2
+  }'
+# → results[]: text + score + context + window.before/after
 
-# 4. Lấy context mới nhất
-curl "http://localhost:8000/transcript/$COL/context/latest?meeting_id=$MID"
+# 3. Lấy context mới nhất (hoặc tại sequence_id cụ thể)
+curl "http://localhost:8000/transcript/meeting-abc123/context"
+# → { "meeting_id": "abc123", "sequence_id": 2, "context": "...", "context_status": "ready" }
 
-# 5. Liệt kê toàn bộ transcript đã thu
-curl "http://localhost:8000/transcript/$COL/meeting/$MID/segments?from_seq=1&limit=200"
+curl "http://localhost:8000/transcript/meeting-abc123/context?sequence_id=1"
+# → context tại câu 1
 
-# 6. Kết thúc — xoá meeting
-curl -X DELETE "http://localhost:8000/transcript/$COL/meeting/$MID"
+# 4. Liệt kê transcript
+curl "http://localhost:8000/transcript/meeting-abc123/segments?from_seq=1&to_seq=10"
 ```
 
-### Cấu trúc payload (Qdrant)
+### Cấu trúc payload (Qdrant — collection `meeting-*`)
 
 ```json
 {
-  "meeting_id":       "meeting_2026_soict_001",
-  "sequence_id":      42,
-  "speaker":          "Đoàn Sỹ Nguyên",
-  "speaker_id":       "user_017",
-  "timestamp":        "2026-05-11T19:52:27Z",
-  "text":             "Chúng ta cần xem lại ngân sách Q4...",
-  "context":          "Tóm tắt hội thoại tính tới câu này...",
-  "context_status":   "ready",
+  "meeting_id":     "abc123",
+  "sequence_id":    42,
+  "speaker":        "Đoàn Sỹ Nguyên",
+  "speaker_id":     "user_017",
+  "text":           "Chúng ta cần xem lại ngân sách Q4...",
+  "timestamp":      "2026-05-11T19:52:27Z",
+  "context":        "Tóm tắt hội thoại tính tới câu này...",
+  "context_status": "ready",
   "context_seq_base": 41,
-  "lang":             "vi",
-  "created_at":       "2026-05-11T19:52:27Z"
+  "lang":           "vi",
+  "created_at":     "2026-05-11T19:52:27Z"
 }
 ```
 
-`context_status` ∈ `pending` | `processing` | `ready` | `failed`.
+`context_status` ∈ `pending` | `processing` | `ready` | `failed` | `disabled`.
 
-### Định nghĩa context
+### Context Building
 
-Theo plan.md: `context[N] = LLM_summarize(context[N-1] + transcript[N-1])`.
-Tức context tại câu N là **bối cảnh dẫn tới câu N** (chưa bao gồm chính câu N). Khi query trả kết quả câu N, app workstation ghép `context` + `text` câu N + `window` để đưa cho LLM phía user.
+`context[N] = LLM_summarize(context[N-1] + transcript[N-1])`
 
-### Tests Phase 2
+- Context tại câu N là **bối cảnh dẫn tới câu N** (chưa gồm chính câu N).
+- LLM self-host trên server (Ollama / LM Studio / OpenAI-compatible).
+- ContextBuilder là background worker in-process.
+- Có thể tắt bằng `LLM_PROVIDER=none` (context_status = `disabled`).
+
+### System Prompt
+
+File: `app/services/llm_client.py`. Prompt hiện tại:
+
+- Vai trò: trợ lý tóm tắt cuộc họp
+- 6 mức ưu tiên giữ nội dung: quyết định → con số → tên → chủ đề → action → quan điểm
+- 4 tình huống tích hợp: mới / lặp / mâu thuẫn / thứ tự thời gian
+- Edge cases: context rỗng, câu dài
+
+### Tests
 
 ```bash
-# Unit test SequenceManager (cần Redis chạy)
+# Cần stack đang chạy (qdrant + redis + rag_api)
+docker compose up -d
+
+# SequenceManager unit test
 pytest tests/test_sequence_manager.py -v
 
-# Integration test (cần stack đang chạy + LLM_PROVIDER=none cho test ổn định)
+# Integration test transcript (cần LLM_PROVIDER=none cho ổn định)
 pytest tests/test_transcript_api.py -v
+
+# Manual test nhanh
+curl http://localhost:8000/health
+curl -X POST http://localhost:8000/transcript/meeting-test/embed \
+  -d '{"speaker":"A","text":"test"}'
 ```
 
----
-
-## Testing
-
-### Manual Test (đã xác nhận hoạt động)
-
-```bash
-COL=test_collection
-MID=meeting_$(date +%s)
-
-# 1. Init meeting
-curl -X POST http://localhost:8000/transcript/$COL/meeting/init \
-  -H "Content-Type: application/json" \
-  -d "{\"meeting_id\": \"$MID\"}"
-
-# 2. Embed transcripts (sequence_id tự động tăng)
-curl -X POST http://localhost:8000/transcript/$COL/embed \
-  -H "Content-Type: application/json" \
-  -d "{\"meeting_id\": \"$MID\", \"speaker\": \"Nguyễn Văn A\", \"text\": \"Chào mọi người.\"}"
-
-# 3. Query với window
-curl -X POST http://localhost:8000/query/transcript \
-  -H "Content-Type: application/json" \
-  -d "{\"collection\": \"$COL\", \"query\": \"ngân sách\", \"meeting_id\": \"$MID\", \"top_k\": 3, \"window_size\": 1}"
-
-# 4. Get segments
-curl "http://localhost:8000/transcript/$COL/meeting/$MID/segments?from_seq=1&to_seq=3"
-
-# 5. Get context
-curl "http://localhost:8000/transcript/$COL/context/latest?meeting_id=$MID"
-```
-
-### Docker Test
-
-```bash
-# Chạy tests trong container
-docker exec rag_api pytest tests/test_transcript_api.py -v --tb=short
-```
-
-> **Lưu ý**: Nếu gặp lỗi encoding, kiểm tra file test có UTF-8 BOM hay không.
-
----
-
-## Known Issues
-
-- Tests file (`test_transcript_api.py`) có thể có encoding issue → chạy manual test thay thế
-- Ollama chưa bật → LLM_PROVIDER=none → context để trống (acceptable)
+> **Lưu ý**: Nếu gặp lỗi encoding khi chạy pytest, kiểm tra UTF-8 BOM trong file test.
 
 ---
 

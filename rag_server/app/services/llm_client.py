@@ -19,18 +19,40 @@ from app.config import settings
 
 
 SYSTEM_PROMPT_TEMPLATE = (
-    "Bạn là trợ lý tóm tắt hội thoại cuộc họp. Nhiệm vụ: cập nhật bản tóm tắt "
-    "bối cảnh cuộc họp khi có một câu nói mới. Bản tóm tắt phải:\n"
-    "- Ngắn gọn, tối đa khoảng {max_tokens} tokens.\n"
-    "- Giữ các quyết định, con số, tên riêng, chủ đề đang thảo luận.\n"
-    "- Viết bằng tiếng Việt, văn phong trung lập, không bịa thông tin.\n"
-    "- Chỉ trả về bản tóm tắt, không thêm lời dẫn."
+    "Bạn là trợ lý tóm tắt cuộc họp. Nhiệm vụ: cập nhật bản tóm tắt bối cảnh "
+    "khi có một câu nói mới.\n\n"
+    "## Cấu trúc đầu vào\n"
+    "Dòng 1: Bối cảnh hiện tại (bản tóm tắt từ các câu trước).\n"
+    "Dòng 3 (sau ---): Câu nói mới cần tích hợp.\n\n"
+    "## Đầu ra\n"
+    "CHỈ một đoạn văn — bản tóm tắt đã cập nhật. Không markdown, không bullet, "
+    "không giải thích, không lặp lại input.\n\n"
+    "## Nguyên tắc giữ nội dung (theo thứ tự ưu tiên)\n"
+    "1. Quyết định đã chốt và kết luận.\n"
+    "2. Con số, thời hạn, mốc thời gian cụ thể.\n"
+    "3. Tên riêng (người, dự án, tổ chức).\n"
+    "4. Chủ đề / luồng thảo luận chính.\n"
+    "5. Hành động cần làm (action items), người phụ trách.\n"
+    "6. Các quan điểm khác nhau (nếu có tranh luận).\n\n"
+    "## Cách tích hợp câu nói mới\n"
+    "- Nếu câu nói chứa thông tin mới → lồng ghép vào bản tóm tắt, "
+    "có thể mở rộng chủ đề tương ứng.\n"
+    "- Nếu câu nói lặp lại ý cũ → không thêm, giữ nguyên bản tóm tắt.\n"
+    "- Nếu câu nói trái ngược với bối cảnh cũ → ghi nhận cả hai phía: "
+    "\"đang tranh luận / chưa thống nhất\".\n"
+    "- Giữ thứ tự thời gian: thông tin mới hơn ở cuối bản tóm tắt.\n\n"
+    "## Giới hạn\n"
+    "- Tối đa {max_tokens} từ.\n"
+    "- Viết bằng tiếng Việt, trung lập, khách quan.\n"
+    "- TUYỆT ĐỐI KHÔNG bịa thông tin, suy luận chủ quan, khuyến nghị.\n"
+    "- Nếu đầu vào không có bối cảnh cũ (dòng 1 rỗng) → tóm tắt câu nói mới.\n"
+    "- Nếu câu nói mới quá dài → chỉ giữ ý chính."
 )
 
 USER_PROMPT_TEMPLATE = (
-    "[Bối cảnh hiện tại]\n{previous_context}\n\n"
-    "[Câu nói mới cần tích hợp vào bối cảnh]\n{new_utterance}\n\n"
-    "Hãy cập nhật bản tóm tắt bối cảnh."
+    "{previous_context}\n"
+    "---\n"
+    "{new_utterance}"
 )
 
 
@@ -119,7 +141,7 @@ class LLMClient:
             "options": {
                 # Ollama dùng `num_predict` để giới hạn output tokens.
                 "num_predict": self.max_tokens,
-                "temperature": 0.2,
+                "temperature": 0.0,
             },
         }
         resp = await client.post(url, json=payload)
@@ -142,7 +164,7 @@ class LLMClient:
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
-            "temperature": 0.2,
+            "temperature": 0.0,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -168,7 +190,7 @@ class LLMClient:
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
             "generationConfig": {
-                "temperature": 0.2,
+                "temperature": 0.0,
                 "maxOutputTokens": self.max_tokens,
             },
         }

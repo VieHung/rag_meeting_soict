@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hướng dẫn sử dụng API — RAG Vector Store</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif; background:#f5f7fa; color:#1a1a2e; line-height:1.7; }
+  .container { max-width:960px; margin:0 auto; padding:20px; }
+
+  h1 { font-size:2em; margin:40px 0 10px; padding-bottom:10px; border-bottom:3px solid #2563eb; color:#1e293b; }
+  h2 { font-size:1.5em; margin:35px 0 10px; padding:8px 0; color:#1e293b; border-left:4px solid #2563eb; padding-left:12px; }
+  h3 { font-size:1.2em; margin:25px 0 8px; color:#334155; }
+
+  p { margin:10px 0; }
+  ul, ol { margin:10px 0 10px 24px; }
+  li { margin:4px 0; }
+
+  blockquote { background:#eef2ff; border-left:4px solid #6366f1; padding:12px 16px; margin:16px 0; border-radius:0 6px 6px 0; }
+  blockquote p { margin:0; }
+
+  table { width:100%; border-collapse:collapse; margin:16px 0; font-size:0.95em; }
+  th, td { padding:10px 12px; text-align:left; border:1px solid #e2e8f0; }
+  th { background:#2563eb; color:#fff; font-weight:600; }
+  tr:nth-child(even) { background:#f8fafc; }
+
+  code { font-family:'JetBrains Mono','Fira Code','Cascadia Code',Consolas,monospace; font-size:0.9em; background:#e2e8f0; padding:2px 6px; border-radius:4px; }
+  pre { background:#1e293b; color:#e2e8f0; padding:16px 20px; border-radius:8px; overflow-x:auto; margin:16px 0; font-size:0.9em; line-height:1.5; }
+  pre code { background:transparent; padding:0; color:inherit; font-size:1em; }
+
+  hr { border:none; border-top:2px solid #e2e8f0; margin:32px 0; }
+
+  strong { color:#0f172a; }
+  a { color:#2563eb; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+
+  .toc { background:#fff; border:1px solid #e2e8f0; border-radius:8px; padding:20px 24px; margin:24px 0; }
+  .toc h2 { border:none; margin-top:0; padding-left:0; }
+  .toc ul { list-style:none; margin:0; padding:0; }
+  .toc li { margin:6px 0; }
+  .toc a { color:#2563eb; }
+
+  .header { background:linear-gradient(135deg,#1e293b,#334155); color:#fff; padding:24px 0; text-align:center; }
+  .header h1 { border:none; color:#fff; margin:0; font-size:2.2em; }
+  .header p { color:#94a3b8; margin:8px 0 0; font-size:1.1em; }
+
+  @media (max-width:640px) { .container { padding:12px; } table { font-size:0.85em; } th, td { padding:6px 8px; } }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="container">
+    <h1>Hướng dẫn sử dụng API</h1>
+    <p>RAG Vector Store — BKMEETING</p>
+  </div>
+</div>
+
+<div class="container">
+  <h1>Hướng dẫn sử dụng API — RAG Vector Store</h1>
+<blockquote>
+<p>Dành cho đội phát triển app phía thiết bị (QCS8550 / workstation).
+Base URL: <code>http://&lt;server-ip&gt;:8000</code></p>
+</blockquote>
+<hr />
+<h2>Mục lục</h2>
+<ol>
+<li><a href="#1-quy-ước-chung">Quy ước chung</a></li>
+<li><a href="#2-phase-1--tài-liệu">Phase 1 — Tài liệu</a></li>
+<li><a href="#3-phase-2--transcript-cuộc-họp">Phase 2 — Transcript cuộc họp</a></li>
+<li><a href="#4-luồng-nghiệp-vụ-điển-hình">Luồng nghiệp vụ điển hình</a></li>
+<li><a href="#5-xử-lý-lỗi">Xử lý lỗi</a></li>
+</ol>
+<hr />
+<h2>1. Quy ước chung</h2>
+<h3>Collection naming</h3>
+<p>Mỗi cuộc họp = một <strong>cặp collection</strong> trên Qdrant, do <strong>app tạo thủ công</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>Loại</th>
+<th>Tiền tố</th>
+<th>Ví dụ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transcript</td>
+<td><code>meeting-{uuid}</code></td>
+<td><code>meeting-c7cfdf57-...</code></td>
+</tr>
+<tr>
+<td>Tài liệu đính kèm</td>
+<td><code>docs-{uuid}</code></td>
+<td><code>docs-c7cfdf57-...</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>meeting_id</code> = <code>{uuid}</code> (giống nhau trong cặp), server suy ra từ tên collection.</p>
+<p><strong>App phải tạo collection trước</strong> qua <code>POST /embed/collections</code> trước khi gọi các endpoint.</p>
+<h3>Meeting ID</h3>
+<p>Không gửi <code>meeting_id</code> trong body. Server tự suy từ collection name:</p>
+<pre class="codehilite"><code>collection = &quot;meeting-a1b2c3d4&quot;  →  meeting_id = &quot;a1b2c3d4&quot;
+</code></pre>
+
+<h3>Content-Type</h3>
+<p>Tất cả request body đều là <code>application/json</code>.</p>
+<h3>HTTP Status</h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Ý nghĩa</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>200</code></td>
+<td>Thành công</td>
+</tr>
+<tr>
+<td><code>202</code></td>
+<td>Đã nhận, đang xử lý nền</td>
+</tr>
+<tr>
+<td><code>400</code></td>
+<td>Lỗi validation (sai prefix, thiếu field)</td>
+</tr>
+<tr>
+<td><code>404</code></td>
+<td>Không tìm thấy</td>
+</tr>
+<tr>
+<td><code>422</code></td>
+<td>Unprocessable entity (text rỗng, query rỗng)</td>
+</tr>
+<tr>
+<td><code>503</code></td>
+<td>Service unavailable (Redis mất kết nối)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>2. Phase 1 — Tài liệu</h2>
+<blockquote>
+<p>Giữ nguyên từ Giai đoạn 1. Dùng cho upload &amp; truy vấn tài liệu cuộc họp.</p>
+</blockquote>
+<h3>2.1. Tạo collection mới</h3>
+<pre class="codehilite"><code class="language-bash">POST /embed/collections
+Content-Type: multipart/form-data
+
+name=meeting-a1b2c3d4
+</code></pre>
+
+<p><strong>Response <code>200</code>:</strong></p>
+<pre class="codehilite"><code class="language-json">{
+  &quot;success&quot;: true,
+  &quot;message&quot;: &quot;Created collection 'meeting-a1b2c3d4'&quot;
+}
+</code></pre>
+
+<h3>2.2. Liệt kê tất cả collections</h3>
+<pre class="codehilite"><code class="language-bash">GET /embed/collections
+</code></pre>
+
+<p><strong>Response:</strong></p>
+<pre class="codehilite"><code class="language-json">{
+  &quot;collections&quot;: [&quot;documents&quot;, &quot;meeting-a1b2c3d4&quot;, &quot;docs-a1b2c3d4&quot;]
+}
+</code></pre>
+
+<h3>2.3. Xoá collection</h3>
+<pre class="codehilite"><code class="language-bash">DELETE /embed/collections
+Content-Type: multipart/form-data
+
+name=meeting-a1b2c3d4
+</code></pre>
+
+<p>Dùng để xoá toàn bộ dữ liệu một cuộc họp (cả transcript lẫn tài liệu).</p>
+<h3>2.4. Upload file tài liệu</h3>
+<pre class="codehilite"><code class="language-bash">POST /embed/file
+Content-Type: multipart/form-data
+
+file=@report.pdf
+collection=docs-a1b2c3d4
+doc_id=  (optional, UUID tự sinh nếu để trống)
+extra_metadata={&quot;author&quot;: &quot;Navis&quot;}  (optional, JSON string)
+</code></pre>
+
+<p><strong>Response <code>200</code> (xử lý nền):</strong></p>
+<pre class="codehilite"><code class="language-json">{
+  &quot;success&quot;: true,
+  &quot;doc_id&quot;: &quot;550e8400-e29b-41d4-a716-446655440000&quot;,
+  &quot;source&quot;: &quot;report.pdf&quot;,
+  &quot;chunks_created&quot;: 0,
+  &quot;message&quot;: &quot;Đã nhận file 'report.pdf', embedding sẽ chạy nền ngay sau response&quot;
+}
+</code></pre>
+
+<p>Hỗ trợ: <code>.pdf</code>, <code>.docx</code>, <code>.txt</code>, <code>.md</code>. Tối đa 50MB.</p>
+<h3>2.5. Embed text</h3>
+<pre class="codehilite"><code class="language-bash">POST /embed/text
+Content-Type: application/json
+
+{
+  &quot;text&quot;: &quot;Nội dung tài liệu...&quot;,
+  &quot;source&quot;: &quot;my_note&quot;,
+  &quot;collection&quot;: &quot;docs-a1b2c3d4&quot;,
+  &quot;doc_id&quot;: &quot;custom-uuid&quot;,     // optional
+  &quot;metadata&quot;: {&quot;author&quot;: &quot;AI&quot;} // optional
+}
+</code></pre>
+
+<h3>2.6. Truy vấn tài liệu</h3>
+<pre class="codehilite"><code class="language-bash">POST /query/
+Content-Type: application/json
+
+{
+  &quot;query&quot;: &quot;nội dung cần tìm&quot;,
+  &quot;collection&quot;: &quot;docs-a1b2c3d4&quot;,
+  &quot;top_k&quot;: 5,
+  &quot;score_threshold&quot;: 0.3,
+  &quot;source_filter&quot;: &quot;report.pdf&quot;    // optional, lọc theo file
+}
+</code></pre>
+
+<p><strong>Response:</strong></p>
+<pre class="codehilite"><code class="language-json">{
+  &quot;query&quot;: &quot;nội dung cần tìm&quot;,
+  &quot;results&quot;: [
+    {
+      &quot;text&quot;: &quot;Đoạn văn khớp nhất...&quot;,
+      &quot;score&quot;: 0.8741,
+      &quot;source&quot;: &quot;report.pdf&quot;,
+      &quot;doc_id&quot;: &quot;550e8400-...&quot;,
+      &quot;chunk_index&quot;: 3,
+      &quot;chunk_total&quot;: 24
+    }
+  ],
+  &quot;total_found&quot;: 3
+}
+</code></pre>
+
+<h3>2.7. Xoá tài liệu</h3>
+<pre class="codehilite"><code class="language-bash"># Xoá theo tên file
+DELETE /embed/{collection}/source/{filename}
+
+# Xoá theo doc_id
+DELETE /embed/{collection}/doc/{doc_id}
+</code></pre>
+
+<h3>2.8. Liệt kê tài liệu trong collection</h3>
+<pre class="codehilite"><code class="language-bash">GET /embed/{collection}/documents
+</code></pre>
+
+<hr />
+<h2>3. Phase 2 — Transcript cuộc họp</h2>
+<blockquote>
+<p>4 endpoint, trong đó <strong>2 core</strong> (bắt buộc dùng) và <strong>2 optional</strong>.</p>
+</blockquote>
+<h3>3.1. Core: Nhập transcript</h3>
+<p><strong>Endpoint:</strong> <code>POST /transcript/{collection}/embed</code></p>
+<p>Gửi <strong>một câu</strong> transcript mỗi lần. Server tự gán <code>sequence_id</code>, lưu vector, và chạy build context nền.</p>
+<p><strong>Request:</strong></p>
+<pre class="codehilite"><code class="language-json">{
+  &quot;speaker&quot;: &quot;Đoàn Sỹ Nguyên&quot;,
+  &quot;speaker_id&quot;: &quot;user_017&quot;,
+  &quot;text&quot;: &quot;Chúng ta cần xem lại ngân sách Q4 trước khi chốt.&quot;,
+  &quot;timestamp&quot;: &quot;2026-05-11T19:52:27Z&quot;,
+  &quot;lang&quot;: &quot;vi&quot;
+}
+</code></pre>
+
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Required</th>
+<th>Ghi chú</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>speaker</code></td>
+<td>string</td>
+<td>✅</td>
+<td>Tên người nói</td>
+</tr>
+<tr>
+<td><code>speaker_id</code></td>
+<td>string</td>
+<td>❌</td>
+<td>ID định danh</td>
+</tr>
+<tr>
+<td><code>text</code></td>
+<td>string</td>
+<td>✅</td>
+<td>Nội dung câu nói, không rỗng</td>
+</tr>
+<tr>
+<td><code>timestamp</code></td>
+<td>ISO 8601</td>
+<td>❌</td>
+<td>Nếu thiếu, server tự gán <code>now()</code></td>
+</tr>
+<tr>
+<td><code>lang</code></td>
+<td>string</td>
+<td>❌</td>
+<td>Mã ngôn ngữ (vi, en...)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Response <code>202</code> (xử lý nền):</strong></p>
+<pre class="codehilite"><code class="language-json">{
+  &quot;meeting_id&quot;: &quot;a1b2c3d4&quot;,
+  &quot;sequence_id&quot;: 42,
+  &quot;point_id&quot;: &quot;f6197721-bf9d-4dd0-a537-7268fb1fe357&quot;,
+  &quot;context_status&quot;: &quot;pending&quot;
+}
+</code></pre>
+
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Ghi chú</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>meeting_id</code></td>
+<td>string</td>
+<td>Suy ra từ collection name</td>
+</tr>
+<tr>
+<td><code>sequence_id</code></td>
+<td>int</td>
+<td>Server gán, bắt đầu từ 1, liên tục, không trùng</td>
+</tr>
+<tr>
+<td><code>point_id</code></td>
+<td>UUID</td>
+<td>ID của vector trong Qdrant</td>
+</tr>
+<tr>
+<td><code>context_status</code></td>
+<td>enum</td>
+<td><code>pending</code> / <code>processing</code> / <code>ready</code> / <code>failed</code> / <code>disabled</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Quan trọng:</strong>
+- Context build chạy nền (bất đồng bộ). <code>context_status = "pending"</code> ngay sau response.
+- Sau ~3-10 giây (tuỳ tốc độ LLM), status chuyển <code>ready</code> và context có thể query được.
+- <code>sequence_id</code> bắt đầu từ 1, tăng dần, không trùng ngay cả khi Redis bị xoá (tự rebuild từ Qdrant).</p>
+<p><strong>Edge cases:</strong>
+- Collection sai prefix (<code>docs-*</code>) → <code>400 Bad Request</code>
+- <code>text</code> rỗng → <code>422 Unprocessable Entity</code>
+- Redis mất kết nối → <code>503 Service Unavailable</code></p>
+<hr />
+<h3>3.2. Core: Truy vấn transcript</h3>
+<p><strong>Endpoint:</strong> <code>POST /query/transcript</code></p>
+<p>Truy vấn ngữ nghĩa trên transcript, trả kết quả kèm <strong>window</strong> (câu lân cận) + <strong>context</strong> (tóm tắt bối cảnh).</p>
+<p><strong>Request:</strong></p>
+<pre class="codehilite"><code class="language-json">{
+  &quot;collection&quot;: &quot;meeting-a1b2c3d4&quot;,
+  &quot;query&quot;: &quot;Quyết định về ngân sách Q4 là gì?&quot;,
+  &quot;meeting_id&quot;: null,
+  &quot;top_k&quot;: 3,
+  &quot;window_size&quot;: 2,
+  &quot;score_threshold&quot;: 0.5,
+  &quot;speaker_filter&quot;: null,
+  &quot;speaker_id_filter&quot;: null,
+  &quot;include_context&quot;: true
+}
+</code></pre>
+
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Default</th>
+<th>Ghi chú</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>collection</code></td>
+<td>string</td>
+<td>—</td>
+<td>Bắt buộc, phải tiền tố <code>meeting-</code></td>
+</tr>
+<tr>
+<td><code>query</code></td>
+<td>string</td>
+<td>—</td>
+<td>Câu hỏi, không rỗng</td>
+</tr>
+<tr>
+<td><code>meeting_id</code></td>
+<td>string</td>
+<td>null</td>
+<td>(KHÔNG DÙNG — để null, server tự suy)</td>
+</tr>
+<tr>
+<td><code>top_k</code></td>
+<td>int</td>
+<td>3</td>
+<td>Số kết quả (1–50)</td>
+</tr>
+<tr>
+<td><code>window_size</code></td>
+<td>int</td>
+<td>2</td>
+<td>±N câu lân cận. <code>0</code> = tắt. Bị clamp theo <code>TRANSCRIPT_MAX_WINDOW_SIZE</code></td>
+</tr>
+<tr>
+<td><code>score_threshold</code></td>
+<td>float</td>
+<td>0.0</td>
+<td>Chỉ trả kết quả có score &gt;= ngưỡng</td>
+</tr>
+<tr>
+<td><code>speaker_filter</code></td>
+<td>string</td>
+<td>null</td>
+<td>Lọc theo tên speaker (exact match)</td>
+</tr>
+<tr>
+<td><code>speaker_id_filter</code></td>
+<td>string</td>
+<td>null</td>
+<td>Lọc theo speaker_id</td>
+</tr>
+<tr>
+<td><code>include_context</code></td>
+<td>bool</td>
+<td>true</td>
+<td><code>false</code> để bỏ qua context (tiết kiệm bandwidth)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Response <code>200</code>:</strong></p>
+<pre class="codehilite"><code class="language-json">{
+  &quot;query&quot;: &quot;Quyết định về ngân sách Q4 là gì?&quot;,
+  &quot;results&quot;: [
+    {
+      &quot;sequence_id&quot;: 42,
+      &quot;speaker&quot;: &quot;Đoàn Sỹ Nguyên&quot;,
+      &quot;speaker_id&quot;: &quot;user_017&quot;,
+      &quot;timestamp&quot;: &quot;2026-05-11T19:52:27Z&quot;,
+      &quot;text&quot;: &quot;Chúng ta cần xem lại ngân sách Q4 trước khi chốt.&quot;,
+      &quot;score&quot;: 0.87,
+      &quot;meeting_id&quot;: &quot;a1b2c3d4&quot;,
+      &quot;context&quot;: &quot;Đã thống nhất cắt 15% chi phí vận hành Q4, giao phòng tài chính lên kế hoạch.&quot;,
+      &quot;context_status&quot;: &quot;ready&quot;,
+      &quot;window&quot;: {
+        &quot;before&quot;: [
+          { &quot;sequence_id&quot;: 40, &quot;speaker&quot;: &quot;Mai Xuân Ngọc&quot;, &quot;text&quot;: &quot;...&quot; },
+          { &quot;sequence_id&quot;: 41, &quot;speaker&quot;: &quot;Đoàn Sỹ Nguyên&quot;, &quot;text&quot;: &quot;...&quot; }
+        ],
+        &quot;after&quot;: [
+          { &quot;sequence_id&quot;: 43, &quot;speaker&quot;: &quot;Mai Xuân Ngọc&quot;, &quot;text&quot;: &quot;...&quot; }
+        ]
+      }
+    }
+  ],
+  &quot;count&quot;: 1
+}
+</code></pre>
+
+<p><strong>Cách app ghép prompt cho LLM phía workstation:</strong></p>
+<p>Mỗi result có sẵn:
+- <code>context</code> — bối cảnh dẫn tới câu này (do LLM server tóm tắt)
+- <code>text</code> — chính câu transcript khớp
+- <code>window.before</code> — N câu trước
+- <code>window.after</code> — N câu sau</p>
+<p>Gợi ý prompt template:</p>
+<pre class="codehilite"><code>Bối cảnh cuộc họp: {context}
+
+Đoạn hội thoại liên quan:
+{các câu trong window.before + text + window.after}
+
+Câu hỏi: {query}
+Trả lời:
+</code></pre>
+
+<hr />
+<h3>3.3. Optional: Lấy context</h3>
+<p><strong>Endpoint:</strong> <code>GET /transcript/{collection}/context</code></p>
+<p>Lấy context (tóm tắt bối cảnh) của cuộc họp.</p>
+<pre class="codehilite"><code class="language-bash"># Context mới nhất
+GET /transcript/meeting-a1b2c3d4/context
+
+# Context tại thời điểm cụ thể
+GET /transcript/meeting-a1b2c3d4/context?sequence_id=10
+</code></pre>
+
+<p><strong>Response <code>200</code>:</strong></p>
+<pre class="codehilite"><code class="language-json">{
+  &quot;meeting_id&quot;: &quot;a1b2c3d4&quot;,
+  &quot;sequence_id&quot;: 10,
+  &quot;context&quot;: &quot;Đã thống nhất cắt 15% chi phí vận hành Q4, giao phòng tài chính lên kế hoạch.&quot;,
+  &quot;context_status&quot;: &quot;ready&quot;,
+  &quot;context_seq_base&quot;: 9
+}
+</code></pre>
+
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Ghi chú</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>context</code></td>
+<td>Bản tóm tắt bối cảnh tại câu <code>sequence_id</code>. Rỗng nếu là câu đầu tiên hoặc context chưa build xong</td>
+</tr>
+<tr>
+<td><code>context_seq_base</code></td>
+<td><code>sequence_id</code> của câu cuối cùng được tính vào context này (thường = <code>sequence_id - 1</code>)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Công thức:</strong> <code>context[N] = LLM_summarize(context[N-1] + text[N-1])</code>
+→ Context tại câu N là <strong>bối cảnh dẫn tới câu N</strong>, chưa gồm chính câu N.</p>
+<hr />
+<h3>3.4. Optional: Liệt kê transcript</h3>
+<p><strong>Endpoint:</strong> <code>GET /transcript/{collection}/segments</code></p>
+<p>Dùng để debug, dựng lại biên bản, hoặc đồng bộ state.</p>
+<pre class="codehilite"><code>GET /transcript/meeting-a1b2c3d4/segments?from_seq=1&amp;to_seq=50&amp;limit=100
+</code></pre>
+
+<table>
+<thead>
+<tr>
+<th>Param</th>
+<th>Type</th>
+<th>Default</th>
+<th>Ghi chú</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>from_seq</code></td>
+<td>int</td>
+<td>1</td>
+<td>Bắt đầu từ</td>
+</tr>
+<tr>
+<td><code>to_seq</code></td>
+<td>int</td>
+<td>(mới nhất)</td>
+<td>Kết thúc tại</td>
+</tr>
+<tr>
+<td><code>limit</code></td>
+<td>int</td>
+<td>100</td>
+<td>Tối đa (cap 1000)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Response:</strong></p>
+<pre class="codehilite"><code class="language-json">{
+  &quot;meeting_id&quot;: &quot;a1b2c3d4&quot;,
+  &quot;collection&quot;: &quot;meeting-a1b2c3d4&quot;,
+  &quot;from_seq&quot;: 1,
+  &quot;to_seq&quot;: 3,
+  &quot;count&quot;: 3,
+  &quot;segments&quot;: [
+    {
+      &quot;sequence_id&quot;: 1,
+      &quot;speaker&quot;: &quot;Đoàn Sỹ Nguyên&quot;,
+      &quot;speaker_id&quot;: null,
+      &quot;timestamp&quot;: &quot;2026-05-20T04:13:25Z&quot;,
+      &quot;text&quot;: &quot;Chúng ta cần xem lại ngân sách Q4...&quot;,
+      &quot;context_status&quot;: &quot;ready&quot;
+    },
+    { &quot;...&quot;: &quot;...&quot; }
+  ]
+}
+</code></pre>
+
+<hr />
+<h2>4. Luồng nghiệp vụ điển hình</h2>
+<h3>4.1. Khởi tạo cuộc họp mới</h3>
+<p>App sinh UUID, tạo 2 collection:</p>
+<pre class="codehilite"><code class="language-bash">UUID=&quot;meeting-$(uuidgen)&quot;  # ví dụ: meeting-c7cfdf57-...
+
+# Tạo collection transcript
+curl -X POST http://localhost:8000/embed/collections -F &quot;name=$UUID&quot;
+
+# Tạo collection tài liệu (cùng UUID, tiền tố docs-)
+curl -X POST http://localhost:8000/embed/collections -F &quot;name=docs-${UUID#meeting-}&quot;
+</code></pre>
+
+<p>(Không cần gọi <code>meeting/init</code> — sequence counter tự khởi tạo ở lần embed đầu tiên.)</p>
+<h3>4.2. Trong cuộc họp (real-time)</h3>
+<p>Mỗi khi có câu transcript hoàn chỉnh, app gửi ngay:</p>
+<pre class="codehilite"><code class="language-bash">curl -X POST http://localhost:8000/transcript/meeting-c7cfdf57-.../embed \
+  -H &quot;Content-Type: application/json&quot; \
+  -d '{
+    &quot;speaker&quot;: &quot;Đoàn Sỹ Nguyên&quot;,
+    &quot;text&quot;: &quot;Tôi đề xuất cắt 15% chi phí vận hành.&quot;
+  }'
+# → 202 { &quot;sequence_id&quot;: 42, &quot;context_status&quot;: &quot;pending&quot; }
+</code></pre>
+
+<p>Có thể gửi liên tục, không cần chờ response trước.</p>
+<h3>4.3. User đặt câu hỏi (real-time)</h3>
+<pre class="codehilite"><code class="language-bash">curl -X POST http://localhost:8000/query/transcript \
+  -H &quot;Content-Type: application/json&quot; \
+  -d '{
+    &quot;collection&quot;: &quot;meeting-c7cfdf57-...&quot;,
+    &quot;query&quot;: &quot;Quyết định về ngân sách Q4 là gì?&quot;,
+    &quot;top_k&quot;: 3,
+    &quot;window_size&quot;: 2
+  }'
+</code></pre>
+
+<p>Kết quả trả về gồm <code>context</code> + <code>window</code> + <code>text</code>. App ghép thành prompt → LLM workstation → câu trả lời.</p>
+<h3>4.4. Kết thúc cuộc họp</h3>
+<pre class="codehilite"><code class="language-bash"># Xoá cả transcript và tài liệu
+curl -X DELETE http://localhost:8000/embed/collections -F &quot;name=meeting-c7cfdf57-...&quot;
+curl -X DELETE http://localhost:8000/embed/collections -F &quot;name=docs-c7cfdf57-...&quot;
+</code></pre>
+
+<p>Counter Redis tự hết hạn sau 7 ngày TTL.</p>
+<hr />
+<h2>5. Xử lý lỗi</h2>
+<h3>HTTP Status code mapping</h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Nguyên nhân</th>
+<th>Cách xử lý</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>400</code></td>
+<td>Sai collection prefix (gọi <code>docs-*</code> vào <code>/transcript</code>)</td>
+<td>Kiểm tra collection name</td>
+</tr>
+<tr>
+<td><code>422</code></td>
+<td><code>text</code> / <code>query</code> rỗng</td>
+<td>Validate trước khi gửi</td>
+</tr>
+<tr>
+<td><code>404</code></td>
+<td>Context/collection không tồn tại</td>
+<td>Kiểm tra <code>sequence_id</code> hợp lệ</td>
+</tr>
+<tr>
+<td><code>503</code></td>
+<td>Redis không kết nối được</td>
+<td>Thử lại sau, kiểm tra Redis service</td>
+</tr>
+</tbody>
+</table>
+<h3>Context status</h3>
+<p>Khi query, mỗi result có <code>context_status</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Status</th>
+<th>Ý nghĩa</th>
+<th>App xử lý</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pending</code></td>
+<td>Vừa embed, chưa build context</td>
+<td>Dùng <code>context</code> hiện có (có thể rỗng) hoặc đợi</td>
+</tr>
+<tr>
+<td><code>processing</code></td>
+<td>LLM đang build</td>
+<td>Đợi 3-5s rồi query lại</td>
+</tr>
+<tr>
+<td><code>ready</code></td>
+<td>Context đã sẵn sàng</td>
+<td>Dùng được</td>
+</tr>
+<tr>
+<td><code>failed</code></td>
+<td>LLM lỗi sau retry</td>
+<td>Fallback: context là bản tóm tắt của câu trước</td>
+</tr>
+<tr>
+<td><code>disabled</code></td>
+<td><code>LLM_PROVIDER=none</code> (tắt build context)</td>
+<td>Không có context, dùng window + text thuần</td>
+</tr>
+</tbody>
+</table>
+<h3>Lưu ý quan trọng</h3>
+<ol>
+<li><strong>Sequence ID:</strong> Server đảm bảo liên tục và không trùng. App không can thiệp.</li>
+<li><strong>Meeting ID:</strong> Không gửi trong body. Server suy từ collection name.</li>
+<li><strong>Context build chậm hơn embed:</strong> Embed trả <code>202</code> ngay, context cần ~3-10 giây. Nếu query ngay sau embed, <code>context_status</code> có thể là <code>pending</code>. Nên đợi hoặc retry.</li>
+<li><strong>Window ở đầu/cuối cuộc họp:</strong> <code>window.before</code> hoặc <code>window.after</code> sẽ là mảng rỗng, không phải lỗi.</li>
+<li><strong>Window size:</strong> Server tự clamp về <code>TRANSCRIPT_MAX_WINDOW_SIZE</code> (mặc định 5) nếu client gửi quá lớn.</li>
+</ol>
+</div>
+
+</body>
+</html>
