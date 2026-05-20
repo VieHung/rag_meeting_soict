@@ -1,7 +1,16 @@
-from fastapi import APIRouter, HTTPException, Depends
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+
 from app.schemas.query import QueryRequest, QueryResponse, QueryResult
+from app.schemas.transcript import (
+    TranscriptQueryRequest,
+    TranscriptQueryResponse,
+)
 from app.services.embedding import EmbeddingService
 from app.services.vector_store import QdrantService
+from app.dependencies import get_transcript_service
+from app.services.transcript_service import TranscriptService
 
 
 router = APIRouter(prefix="/query", tags=["Query"])
@@ -15,7 +24,10 @@ def get_qdrant() -> QdrantService:
     return QdrantService()
 
 
-@router.post("/", response_model=QueryResponse, summary="Truy vấn ngữ nghĩa")
+# ---- Phase 1: query tài liệu (giữ nguyên) ------------------------------------
+
+
+@router.post("/", response_model=QueryResponse, summary="Truy vấn ngữ nghĩa (tài liệu)")
 async def query_documents(
     request: QueryRequest,
     embedder: EmbeddingService = Depends(get_embedder),
@@ -44,3 +56,42 @@ async def query_documents(
         results=results,
         total_found=len(results),
     )
+
+
+# ---- Phase 2: query transcript -----------------------------------------------
+
+MEETING_PREFIX = "meeting-"
+
+
+class InvalidCollectionPrefix(Exception):
+    pass
+
+
+def _validate_meeting_collection(collection: Optional[str]) -> str:
+    if collection is None:
+        raise InvalidCollectionPrefix("collection is required for transcript query")
+    if not collection.startswith(MEETING_PREFIX):
+        raise InvalidCollectionPrefix(
+            f"collection must start with '{MEETING_PREFIX}' for transcript query"
+        )
+    return collection
+
+
+@router.post(
+    "/transcript",
+    response_model=TranscriptQueryResponse,
+    summary="Truy vấn ngữ nghĩa trên transcript (kèm window ±N câu)",
+)
+async def query_transcript(
+    request: TranscriptQueryRequest,
+    service: TranscriptService = Depends(get_transcript_service),
+):
+    try:
+        _validate_meeting_collection(request.collection)
+    except InvalidCollectionPrefix as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        return await service.query_transcript(request)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))

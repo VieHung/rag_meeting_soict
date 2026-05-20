@@ -13,6 +13,36 @@ services:
       - QDRANT__SERVICE__HTTP_PORT=6333
     restart: unless-stopped
 
+  redis:
+    image: redis:7.2-alpine
+    container_name: redis_server
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./redis_data:/data
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--save",
+        "60",
+        "1"
+      ]
+    restart: unless-stopped
+
+  # Optional: Ollama local cho ContextBuilder.
+  # Bật bằng: docker compose --profile ollama up -d
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_server
+    profiles: ["ollama"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama_data:/root/.ollama
+    restart: unless-stopped
+
   rag_api:
     build: .
     container_name: rag_api
@@ -22,6 +52,10 @@ services:
       - ./app:/app/app
     env_file:
       - .env
+    environment:
+      - QDRANT_HOST=qdrant
+      - REDIS_HOST=redis
     depends_on:
       - qdrant
+      - redis
     restart: unless-stopped
