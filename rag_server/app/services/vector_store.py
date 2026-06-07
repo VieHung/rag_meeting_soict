@@ -24,22 +24,30 @@ class QdrantService:
             self._ensure_collection()
 
     def _ensure_collection(self):
-        existing = [c.name for c in self._client.get_collections().collections]
-        if self._collection not in existing:
-            self._client.create_collection(
-                collection_name=self._collection,
-                vectors_config=VectorParams(
-                    size=settings.embedding_dim,
-                    distance=Distance.COSINE,
-                ),
-            )
-            self._client.create_payload_index(
-                collection_name=self._collection,
-                field_name="source",
-                field_schema="keyword",
-            )
-            QdrantService._collections_created.add(self._collection)
-            print(f"Created Qdrant collection: '{self._collection}'")
+        # Idempotent + an toàn với race: nhiều background task (embed song song lần
+        # đầu vào collection mới) có thể cùng vượt qua check "chưa tồn tại" rồi cùng
+        # gọi create_collection -> kẻ thua nhận 409 Conflict. Nuốt lỗi đó nếu sau
+        # cùng collection đã tồn tại, để embedding không bị mất trắng.
+        if not self._client.collection_exists(self._collection):
+            try:
+                self._client.create_collection(
+                    collection_name=self._collection,
+                    vectors_config=VectorParams(
+                        size=settings.embedding_dim,
+                        distance=Distance.COSINE,
+                    ),
+                )
+                self._client.create_payload_index(
+                    collection_name=self._collection,
+                    field_name="source",
+                    field_schema="keyword",
+                )
+                print(f"Created Qdrant collection: '{self._collection}'")
+            except Exception:
+                # Task khác đã tạo xong giữa check và create -> chấp nhận nếu đã có.
+                if not self._client.collection_exists(self._collection):
+                    raise
+        QdrantService._collections_created.add(self._collection)
 
     def upsert_chunks(
         self,

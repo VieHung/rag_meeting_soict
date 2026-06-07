@@ -10,6 +10,27 @@
 
 ---
 
+## 0. Trạng thái triển khai (cập nhật 2026-06-07)
+
+> Phần này phản ánh **hiện trạng vận hành**; phần thiết kế bên dưới (mục 1→14) giữ nguyên làm nguồn sự thật.
+
+- ✅ **Đã xong:** 4 endpoint v2; SequenceManager (Redis atomic, self-heal); embedding chạy trên
+  **NPU Qualcomm AI080** (backend `qaic`, `intfloat/multilingual-e5-base` 768d, prefix E5).
+  Deploy bằng Docker, `rag_api` host **`:18000`** → container `1904`.
+- ⚙️ **LLM build-context ĐANG TẮT:** `LLM_PROVIDER=none` → ContextBuilder bỏ qua, mọi câu có
+  `context_status="disabled"`, trường `context` rỗng. (Để bật: Ollama + `LLM_PROVIDER=ollama`,
+  `qwen2.5:7b`.) Vì thế các mục về luồng LLM (8.2) hiện chưa hoạt động trên môi trường thật.
+- ⚠️ **Sự cố hạ tầng đã biết:** `/transcript/.../embed` có thể trả **500** do Qdrant
+  "Too many open files" — container Qdrant chạy `nofile` soft = 1024 trong khi mỗi cuộc họp tạo
+  một collection riêng. Khắc phục: nâng `ulimits.nofile` cho service `qdrant` + recreate
+  (chi tiết: `rag_server/README.md` → "Vận hành & sự cố thường gặp"). **Chưa áp dụng.**
+- ⚠️ **Race tạo collection (TOCTOU):** `QdrantService` (Phase 1) đã vá idempotent; còn
+  `TranscriptStore.ensure_collection` chưa vá → câu transcript đầu của meeting mới có thể rớt khi
+  gửi đồng thời. Cần sửa.
+- 🧪 **Kiểm thử:** `rag_server/scripts/test_live_api.py` — bộ edge-case bắn HTTP thật vào `:18000`.
+
+---
+
 ## 1. Bối cảnh
 
 Hệ thống **BKMEETING — Phòng Họp Thông Minh kết hợp Tổ Thư Ký Ảo** (SOICT / NAVIS Center, ĐHBK Hà Nội).
@@ -98,7 +119,7 @@ Mỗi cuộc họp có **một cặp collection**, do app **tạo thủ công** 
 | D4 | Chunking transcript? | **Không.** Mỗi câu transcript = đúng 1 vector. |
 | D5 | LLM build context đặt ở đâu? | **Self-host trên chính server VectorDB** — server này độc lập và **mạnh** (không phải thiết bị QCS8550), đủ sức chạy một LLM thực thụ. ContextBuilder là background worker **in-process**, gọi thẳng LLM self-host. Mặc định Ollama; cấu hình `LLM_MODEL` theo VRAM/CPU server thực tế. |
 | D6 | Context lưu ở đâu? | **Trường `context` trong payload (metadata) của vector** trong collection `meeting-*`. (Yêu cầu trực tiếp của người dùng.) |
-| D7 | Embedding transcript dùng model nào? | Dùng lại `paraphrase-multilingual-MiniLM-L12-v2` (384 chiều) sẵn có. |
+| D7 | Embedding transcript dùng model nào? | `intfloat/multilingual-e5-base` (768 chiều, Việt + Anh), chạy trên NPU Qualcomm AI080 (backend `qaic`). Câu transcript embed như **passage** (prefix `passage: `), query dùng prefix `query: `. |
 | D8 | `meeting_id` lấy từ đâu? | **Suy ra từ tên collection**, không yêu cầu client gửi. Không dùng để lọc khi query. |
 | D9 | Thứ tự build context | Build **tuần tự theo collection** (hàng đợi FIFO + worker) → đảm bảo `context[N-1]` sẵn sàng trước khi build `context[N]`. |
 
@@ -107,7 +128,7 @@ Mỗi cuộc họp có **một cặp collection**, do app **tạo thủ công** 
 ## 5. Mô hình dữ liệu
 
 ### 5.1. Collection `meeting-{uuid}` trên Qdrant
-- Vector size **384**, distance **Cosine**.
+- Vector size **768**, distance **Cosine**.
 - Point ID: UUID v4 tự sinh.
 - App tạo collection thủ công trước khi embed (hoặc endpoint `/embed` lazy-create nếu chưa có — idempotent).
 
@@ -226,9 +247,9 @@ Lưu **một câu** transcript. Server gán `sequence_id`, build context chạy 
 
 **Xử lý (đồng bộ):**
 1. Validate.
-2. Lazy-create collection nếu chưa tồn tại (size 384, Cosine).
+2. Lazy-create collection nếu chưa tồn tại (size 768, Cosine).
 3. `SequenceManager.next(collection)` → `sequence_id`.
-4. `EmbeddingService.encode(text)` → vector 384.
+4. `EmbeddingService.embed_texts([text])` (passage) → vector 768.
 5. `QdrantService.upsert` 1 point, payload `context_status="pending"` (hoặc `"disabled"` nếu `LLM_PROVIDER=none`).
 6. Đẩy job `(collection, sequence_id)` vào hàng đợi context worker.
 7. Trả response ngay.
@@ -333,7 +354,7 @@ App gửi câu transcript
         ├ validate (tiền tố meeting-, text)
         ├ lazy-create collection nếu thiếu
         ├ SequenceManager.next(collection) ──INCR Redis──► sequence_id = N
-        ├ EmbeddingService.encode(text) ──► vector[384]
+        ├ EmbeddingService.embed_texts([text]) ──► vector[768]
         ├ QdrantService.upsert(point, context_status="pending")
         ├ enqueue job (collection, N) vào context worker
         └► 202 { sequence_id: N, context_status: "pending" }

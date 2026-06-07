@@ -1,0 +1,17 @@
+# Runtime deps cho container chạy backend NPU (EMBEDDING_BACKEND=qaic).
+# KHÔNG gồm sentence-transformers/torch — backend qaic chỉ cần tokenizer + numpy + qaic.
+# Pin theo venv host (Ubuntu 22.04, đã chứng minh chạy với qaicrt/numpy 2.x).
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.9
+transformers==4.57.6
+qdrant-client==1.10.1
+pypdf==5.1.0
+python-docx==1.1.2
+openpyxl==3.1.5
+pydantic==2.13.4
+pydantic-settings>=2.7.0
+python-dotenv==1.0.1
+numpy==2.2.6
+httpx==0.27.0
+redis==5.0.8

@@ -1,0 +1,14 @@
+# Phụ thuộc CHỈ dùng ở bước build QPC (offline, trên host AI080) — không cần lúc runtime.
+# Dùng để export model HuggingFace sang ONNX trước khi compile bằng qaic-exec.
+#   pip install -r requirements-build.txt
+#
+# LƯU Ý: từ optimum 2.x, bộ export ONNX được tách sang package riêng `optimum-onnx`.
+# Dùng `optimum[exporters]` (cách cũ) sẽ KHÔNG đăng ký subcommand `optimum-cli export onnx`.
+optimum-onnx>=0.1.0
+optimum>=2.0.0
+onnx>=1.16.0
+onnxruntime>=1.17.0
+torch>=2.2.0
+
+# LƯU Ý: package `qaic` (Qualcomm Cloud AI runtime) và CLI `qaic-exec` KHÔNG có trên PyPI.
+# Chúng do Qualcomm Apps/Platform SDK cung cấp, cài sẵn trên server AI080.

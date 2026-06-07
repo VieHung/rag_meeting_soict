@@ -1,7 +1,10 @@
 # Hướng dẫn sử dụng API — RAG Vector Store
 
 > Dành cho đội phát triển app phía thiết bị (QCS8550 / workstation).
-> Base URL: `http://<server-ip>:8000`
+> Base URL: `http://<server-ip>:8000` (dev native) hoặc **`http://<server-ip>:18000`** (Docker —
+> host `18000` map vào container `1904`). Embedding chạy trên **NPU Qualcomm AI080** (backend `qaic`),
+> model `intfloat/multilingual-e5-base` (768 chiều). Trường `context` chỉ có khi server bật LLM
+> build-context — hiện `LLM_PROVIDER=none` nên `context_status = "disabled"` và `context` rỗng.
 
 ---
 
@@ -50,6 +53,7 @@ Tất cả request body đều là `application/json`.
 | `400` | Lỗi validation (sai prefix, thiếu field) |
 | `404` | Không tìm thấy |
 | `422` | Unprocessable entity (text rỗng, query rỗng) |
+| `500` | Lỗi server (vd Qdrant "Too many open files" — xem mục 5) |
 | `503` | Service unavailable (Redis mất kết nối) |
 
 ---
@@ -477,7 +481,13 @@ Counter Redis tự hết hạn sau 7 ngày TTL.
 | `400` | Sai collection prefix (gọi `docs-*` vào `/transcript`) | Kiểm tra collection name |
 | `422` | `text` / `query` rỗng | Validate trước khi gửi |
 | `404` | Context/collection không tồn tại | Kiểm tra `sequence_id` hợp lệ |
+| `500` | Qdrant "Too many open files" (fd `nofile` của container Qdrant cạn) | Lỗi phía hạ tầng, không phải client. Báo đội vận hành nâng `ulimits.nofile` cho container Qdrant rồi recreate; client retry sau |
 | `503` | Redis không kết nối được | Thử lại sau, kiểm tra Redis service |
+
+> **Lỗi `500` "Too many open files"** không liên quan dữ liệu client gửi mà do container Qdrant
+> chạy với `nofile` soft = 1024 (mặc định Docker) trong khi mỗi cuộc họp tạo một collection riêng.
+> Khắc phục ở phía server (xem `rag_server/README.md` → "Vận hành & sự cố thường gặp"). Câu transcript
+> bị rớt do lỗi này KHÔNG được cấp `sequence_id` → client nên retry câu đó.
 
 ### Context status
 

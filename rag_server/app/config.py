@@ -9,8 +9,16 @@ class Settings(BaseSettings):
     qdrant_collection_name: str = "documents"
 
     # === Embedding ===
-    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    embedding_dim: int = 384
+    # Backend: "sentence_transformers" (dev/CPU/GPU) | "qaic" (NPU Qualcomm AI080)
+    embedding_backend: str = "sentence_transformers"
+    embedding_model: str = "intfloat/multilingual-e5-base"
+    embedding_dim: int = 768
+    # Prefix kiểu E5 — đặt rỗng nếu dùng model đối xứng (vd MiniLM).
+    embedding_query_prefix: str = "query: "
+    embedding_passage_prefix: str = "passage: "
+    # Backend qaic: đường dẫn QPC đã compile + seq_len tĩnh khi compile.
+    embedding_qpc_path: Optional[str] = None
+    embedding_max_seq_len: int = 128
     chunk_size: int = 512
     chunk_overlap: int = 64
     top_k_default: int = 5

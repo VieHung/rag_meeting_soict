@@ -1,0 +1,14 @@
+# Không đưa state/khối lớn vào build context
+qdrant_storage/
+redis_data/
+ollama_data/
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+qpc/
+qpc_build/
+.git/
+.env

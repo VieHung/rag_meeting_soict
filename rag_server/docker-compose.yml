@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   qdrant:
     image: qdrant/qdrant:v1.10.0
@@ -47,14 +45,40 @@ services:
     build: .
     container_name: rag_api
     ports:
-      - "8000:8000"
+      - "18000:1904"  # host 18000 → container 1904
     volumes:
       - ./app:/app/app
+      # Qualcomm SDK (qaicrt/qaiccc/libQAic + wheel qaic) — bắt buộc cho backend qaic.
+      - /opt/qti-aic:/opt/qti-aic:ro
+      # QPC đã compile (scripts/build_qpc.sh) + HuggingFace cache (chứa tokenizer e5-base).
+      - ${QPC_HOST_DIR:-/home/ai/hungtv/qpc}:/opt/qpc:ro
+      - ${HF_HOST_DIR:-/home/ai/hungtv/qpc_build/hf_cache}:/opt/hf_cache
     env_file:
       - .env
     environment:
       - QDRANT_HOST=qdrant
       - REDIS_HOST=redis
+      # Backend NPU AI080
+      - EMBEDDING_BACKEND=qaic
+      - EMBEDDING_QPC_PATH=/opt/qpc/e5-base
+      - EMBEDDING_MAX_SEQ_LEN=128
+      # Nạp native lib + module SDK từ mount (qaicrt/qaiccc .so, QAicApi_pb2)
+      - PYTHONPATH=/opt/qti-aic/dev/lib/x86_64:/opt/qti-aic/dev/python
+      # apps/ chứa libtorch_cpu.so + libc10.so mà qaiccc cần.
+      - LD_LIBRARY_PATH=/opt/qti-aic/dev/lib/x86_64:/opt/qti-aic/dev/lib/x86_64/apps:/opt/qti-aic/lib/x86_64
+      # Tokenizer load offline từ cache đã mount
+      - HF_HOME=/opt/hf_cache
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    # === Passthrough NPU Qualcomm AI080 (Cloud AI 100 / a080) ===
+    devices:
+      - /dev/accel/accel0:/dev/accel/accel0
+      - /dev/accel/accel1:/dev/accel/accel1
+      - /dev/accel/accel2:/dev/accel/accel2
+      - /dev/accel/accel3:/dev/accel/accel3
+    # gid của group 'qaic' trên host (id -g qaic). Cho phép truy cập /dev/accel*.
+    group_add:
+      - "999"
     depends_on:
       - qdrant
       - redis

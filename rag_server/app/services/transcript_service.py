@@ -117,7 +117,9 @@ class TranscriptService:
 
         sequence_id = await self._seq.next(col)
 
-        vector = await asyncio.to_thread(self._embedder.embed_query, text)
+        # Câu transcript là PASSAGE (đối tượng được search tới), không phải query
+        # → dùng embed_texts để nhận đúng prefix "passage:" cho model E5.
+        vector = (await asyncio.to_thread(self._embedder.embed_texts, [text]))[0]
         timestamp = request.timestamp or datetime.now(timezone.utc)
 
         context_status = "pending"

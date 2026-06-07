@@ -1,3 +1,8 @@
+rag_server/qpc/
+rag_server/qpc_build/
+*.onnx
+*.bin
+
 # === Environment ===
 rag_server/.env
 .env
