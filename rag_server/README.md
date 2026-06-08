@@ -366,6 +366,26 @@ Response:
 | `CONTEXT_MAX_RETRY` | 2 | Số lần retry khi LLM lỗi |
 | `CONTEXT_TIMEOUT_SECONDS` | 30 | Timeout mỗi lần gọi LLM |
 
+### Hybrid retrieval & Reranker (tùy chọn — kiểu RAGFlow)
+
+| Variable | Default | Mô Tả |
+|----------|---------|-------|
+| `HYBRID_ENABLED` | false | Bật fusion từ khóa (BM25) + vector cho `/query/` và `/query/transcript` |
+| `HYBRID_VECTOR_WEIGHT` | 0.7 | Trọng số điểm vector khi fuse |
+| `HYBRID_TERM_WEIGHT` | 0.3 | Trọng số điểm BM25 khi fuse |
+| `HYBRID_FETCH_MULTIPLIER` | 3 | Fetch `top_k × N` ứng viên trước khi fuse/rerank |
+| `RERANK_PROVIDER` | none | `none` \| `local` (CrossEncoder) \| `http` (TEI/Infinity/Xinference) |
+| `RERANK_MODEL` | BAAI/bge-reranker-v2-m3 | Model rerank (đa ngôn ngữ, hỗ trợ tiếng Việt) |
+| `RERANK_BASE_URL` | (rỗng) | Endpoint rerank cho `provider=http` |
+| `RERANK_API_KEY` | (rỗng) | Key cho endpoint rerank (nếu cần) |
+| `RERANK_TIMEOUT_SECONDS` | 30 | Timeout gọi rerank |
+
+> **Mặc định cả hai TẮT** → hành vi truy vấn y hệt bản pure-vector. Đây là tính
+> năng nâng chất lượng lấy cảm hứng từ RAGFlow (fusion `term + vector`, cross-encoder
+> rerank), **không thêm endpoint, không đổi hình dạng response** (chỉ `score` phản
+> ánh điểm cuối). Khi bật, pipeline truy vấn: vector search (fetch nhiều hơn) →
+> fuse BM25 → rerank (nếu bật) → cắt `top_k`.
+
 ---
 
 ## Docker Deployment

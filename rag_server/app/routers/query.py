@@ -2,12 +2,15 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from app.config import settings
 from app.schemas.query import QueryRequest, QueryResponse, QueryResult
 from app.schemas.transcript import (
     TranscriptQueryRequest,
     TranscriptQueryResponse,
 )
 from app.services.embedding import EmbeddingService
+from app.services.reranker import get_reranker
+from app.services.retrieval import fuse
 from app.services.vector_store import QdrantService
 from app.dependencies import get_transcript_service
 from app.services.transcript_service import TranscriptService
@@ -38,16 +41,30 @@ async def query_documents(
     qdrant = QdrantService(request.collection)
     query_vector = embedder.embed_query(request.query)
 
+    # Hybrid/rerank (RAGFlow-style) — gated. Khi cả hai TẮT, fetch_k == top_k
+    # và luồng y hệt bản pure-vector cũ.
+    reranker = get_reranker()
+    need_more = settings.hybrid_enabled or reranker.enabled
+    fetch_k = (
+        max(request.top_k, request.top_k * settings.hybrid_fetch_multiplier)
+        if need_more
+        else request.top_k
+    )
+
     raw_results = qdrant.search(
         query_vector=query_vector,
-        top_k=request.top_k,
+        top_k=fetch_k,
         source_filter=request.source_filter,
     )
 
-    filtered = [
-        r for r in raw_results
-        if r["score"] >= request.score_threshold
-    ]
+    # score_threshold áp trên điểm vector gốc (giữ nguyên ngữ nghĩa) trước khi fuse.
+    filtered = [r for r in raw_results if r["score"] >= request.score_threshold]
+
+    if settings.hybrid_enabled:
+        filtered = fuse(request.query, filtered)
+    if reranker.enabled:
+        filtered = await reranker.rerank(request.query, filtered)
+    filtered = filtered[: request.top_k]
 
     results = [QueryResult(**r) for r in filtered]
 

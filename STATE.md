@@ -113,8 +113,8 @@ Tầng thiết bị (QCS8550) ──HTTP──► FastAPI App
                                     └── QdrantService ──► Qdrant
 ```
 
-- **ContextBuilder**: background worker in-process (FastAPI BackgroundTasks)
-- **context_worker.py** (asyncio.Queue riêng): chưa implement
+- **ContextBuilder**: build context tuần tự, gọi LLM tóm tắt (logic không đổi)
+- **context_worker.py** (asyncio.Queue + 1 worker FIFO): ✅ đã implement — `POST /transcript/{collection}/embed` enqueue job thay cho `BackgroundTasks` → đảm bảo thứ tự build (D9)
 - **SequenceManager**: Redis atomic INCR, TTL 7 ngày, self-healing từ Qdrant
 
 ## Files quan trọng
@@ -138,22 +138,25 @@ Tầng thiết bị (QCS8550) ──HTTP──► FastAPI App
 | `rag_server/app/utils/redis_client.py` | Singleton async Redis client |
 | `rag_server/app/dependencies.py` | DI wiring |
 
+## Đã hoàn thiện (đợt 2026-06-07 — lấy cảm hứng RAGFlow, giữ tinh thần v2)
+
+- ✅ **context_worker.py (D9)**: `app/workers/context_worker.py` — asyncio.Queue + 1 worker FIFO; router enqueue thay `BackgroundTasks`; start/stop trong lifespan (drain khi shutdown).
+- ✅ **/embed/info + /embed/info/{collection}**: wire endpoint đã ghi trong README (dùng `QdrantService.collection_info()` sẵn có); kiểm tra tồn tại trước để không tạo nhầm collection rỗng.
+- ✅ **/health kiểm tra dependency**: ping Redis + check Qdrant + báo LLM provider; trả 503 nếu Qdrant/Redis chết (vẫn giữ `status: ok` khi khỏe).
+- ✅ **Logging**: thay `print()` bằng `logging.basicConfig` trong `main.py`.
+- ✅ **Tests khớp v2**: rewrite `test_sequence_manager.py` theo API lazy-init (`next(collection)`, rebuild từ Qdrant); `test_api.py` đã hợp lệ nhờ wire `/embed/info`.
+- ✅ **Hybrid retrieval + Reranker (OPTIONAL, mặc định TẮT)**: `app/services/retrieval.py` (BM25+vector fusion) + `app/services/reranker.py` (`none|local|http`); dùng chung cho `/query/` và `/query/transcript`; **không thêm endpoint, response không đổi hình dạng**.
+
 ## Tiếp theo cần làm
 
-### 1. 🔴 Bảo mật: API key
-File `.env` chứa API key dạng plaintext. Cần `.gitignore` + Docker secrets cho production.
+### 1. 🔴 Rotate API key đang lộ
+`.env` (đã được `.gitignore`, KHÔNG track trong git) vẫn chứa `LLM_API_KEY` plaintext trên đĩa. Nên **rotate key** và dùng env injection / Docker secret cho production.
 
-### 2. 🟡 context_worker.py riêng
-Hiện tại dùng BackgroundTasks. Plan yêu cầu asyncio.Queue + worker FIFO riêng để đảm bảo thứ tự build (D9) và drain khi shutdown.
+### 2. 🟡 pytest encoding trên Windows
+File test KHÔNG có BOM và compile sạch — lỗi encoding cũ là do console Windows (cp1252) khi in tiếng Việt. Khắc phục: chạy với `PYTHONUTF8=1` (hoặc `set PYTHONIOENCODING=utf-8`).
 
-### 3. 🟡 Fix pytest encoding
-```
-pytest tests/test_transcript_api.py -v
-# Có lỗi encoding (UTF-8 BOM?) — cần fix test file
-```
+### 3. 🟢 Cleanup collection test cũ
+26 collections đang tồn tại, phần lớn là test. Nên xoá qua `DELETE /embed/collections` (form field `name`).
 
-### 4. 🟢 Cleanup collection test cũ
-26 collections đang tồn tại, phần lớn là test. Nên xoá qua `DELETE /embed/collections/{name}`.
-
-### 5. 🟢 Đánh giá chất lượng context
-LLM đang build context thành công. Cần kiểm tra chất lượng tóm tắt với dữ liệu thực tế (nhiều speaker, nhiều chủ đề).
+### 4. 🟢 Đánh giá chất lượng context + retrieval
+Kiểm tra chất lượng tóm tắt với dữ liệu thực tế; benchmark `HYBRID_ENABLED=true` và `RERANK_PROVIDER=local` xem cải thiện thứ hạng cho truy vấn nhiều tên riêng/con số.

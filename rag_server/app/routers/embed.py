@@ -168,6 +168,28 @@ async def list_documents(collection: str):
     return {"documents": docs, "total": len(docs)}
 
 
+@router.get("/info", summary="Thông tin collection mặc định")
+async def collection_info_default():
+    return _collection_info(settings.qdrant_collection_name)
+
+
+@router.get("/info/{collection}", summary="Thông tin collection cụ thể")
+async def collection_info(collection: str):
+    return _collection_info(collection)
+
+
+def _collection_info(collection: str):
+    # Kiểm tra tồn tại TRƯỚC khi khởi tạo QdrantService — constructor của nó
+    # tự tạo collection nếu thiếu, nên không được gọi cho collection chưa có
+    # (tránh tạo nhầm collection rỗng khi chỉ đọc info).
+    if collection not in QdrantService.list_collections():
+        raise HTTPException(status_code=404, detail=f"Collection '{collection}' không tồn tại")
+    try:
+        return QdrantService(collection).collection_info()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Không lấy được thông tin collection: {e}")
+
+
 @router.get("/collections", summary="Liệt kê tất cả collections")
 async def list_collections():
     return {"collections": QdrantService.list_collections()}

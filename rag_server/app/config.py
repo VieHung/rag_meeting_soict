@@ -39,9 +39,26 @@ class Settings(BaseSettings):
     context_max_retry: int = 2
     context_timeout_seconds: float = 30.0
 
+    # === Hybrid retrieval (RAGFlow-style fusion: term + vector) — OPTIONAL ===
+    # Mặc định TẮT → hành vi truy vấn y hệt bản pure-vector hiện tại.
+    hybrid_enabled: bool = False
+    hybrid_vector_weight: float = 0.7     # trọng số điểm vector (cosine)
+    hybrid_term_weight: float = 0.3       # trọng số điểm từ khóa (BM25)
+    hybrid_fetch_multiplier: int = 3      # fetch top_k * N ứng viên trước khi fuse
+
+    # === Reranker (cross-encoder) — OPTIONAL, gated như LLM ===
+    rerank_provider: str = "none"         # none | local | http
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    rerank_base_url: Optional[str] = None  # endpoint cho provider=http (TEI/Infinity/Xinference)
+    rerank_api_key: Optional[str] = None
+    rerank_timeout_seconds: float = 30.0
+
     class Config:
         env_file = ".env"
         case_sensitive = False
+        # Bỏ qua biến môi trường lạ (không raise ValidationError khi host có
+        # sẵn các env khác — vd OPENROUTER_API_KEY, các CI/CD inject...).
+        extra = "ignore"
 
 
 settings = Settings()
