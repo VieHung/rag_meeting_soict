@@ -10,8 +10,10 @@ Workflow:
 5. Dump tất cả kết quả ra ``eval/results/`` + in bảng tóm tắt.
 
 Có thể chạy:
-    bash eval/run_retrieval.sh          # retrieval eval nhanh (~30s)
-    bash eval/run_full.sh               # retrieval + RAGAS subset (~5-10 phút)
+    python -m eval.run_eval --phase retrieval            # retrieval eval nhanh (~30s)
+    python -m eval.run_eval --phase all --ragas-subset 4 # retrieval + RAGAS subset
+
+Để chạy benchmark đầy đủ (4 metric × 2 config), dùng ``eval.run_comprehensive``.
 """
 from __future__ import annotations
 

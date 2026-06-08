@@ -1,7 +1,6 @@
 """Comprehensive RAG benchmark — retrieval matrix + RAGAS full (4 metrics) × config.
 
-Khác với ``run_eval.py`` / ``run_ragas.py`` (chạy subset 4 câu, 2 metric, model 8K):
-script này chạy **toàn diện**:
+Khác với ``run_eval.py`` (retrieval matrix + RAGAS subset), script này chạy **toàn diện**:
 
 1. **Retrieval matrix** (deterministic, no LLM): docs + transcript × {pure_vector, hybrid}.
 2. **RAGAS đầy đủ**: TOÀN BỘ gold dataset (12 docs + 10 transcript) × {pure_vector, hybrid},

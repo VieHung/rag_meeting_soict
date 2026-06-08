@@ -250,21 +250,14 @@ class Config:
 
 ## 7. Cách reproduce
 
+> Các script `.sh` của lần chạy này đã được thay bằng `eval/run_comprehensive.py`.
+> Xem **[eval/README.md](README.md)** để biết cách chạy hiện tại.
+
 ```bash
-# 1. Đảm bảo LM Studio đang chạy với google/gemma-4-e4b loaded tại :1234.
-curl -s http://192.168.240.1:1234/v1/models | jq '.data[].id'
-
-# 2. Chạy retrieval eval (deterministic, ~30s).
-wsl -d Ubuntu bash /mnt/c/Users/navis/hungtv/rag_base/eval/run_retrieval.sh
-
-# 3. Chạy full eval (retrieval + RAGAS LLM judge subset 4, ~12 phút).
-wsl -d Ubuntu bash /mnt/c/Users/navis/hungtv/rag_base/eval/run_full.sh
-
-# 4. Chạy RAGAS focused (chỉ RAGAS, subset 4, ~10 phút).
-wsl -d Ubuntu bash /mnt/c/Users/navis/hungtv/rag_base/eval/run.sh
-
-# 5. Xem kết quả.
-cat /mnt/c/Users/navis/hungtv/rag_base/eval/results/metrics.json
+# từ rag_base/, với venv active
+python -m eval.run_comprehensive --skip-ragas        # retrieval matrix (~30s)
+python -m eval.run_comprehensive                     # full retrieval + RAGAS
+python -m eval.gen_report                            # render REPORT_COMPREHENSIVE.md
 ```
 
 **Kết quả ghi ra:**

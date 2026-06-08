@@ -58,7 +58,7 @@ Giai đoạn 3 **xây tiếp trên nền này**, không làm lại từ đầu.
 
 ---
 
-## 4. Quyết định Kiến trúc (tiếp nối D1–D9 của phase2plan_v2)
+## 4. Quyết định Kiến trúc (tiếp nối D1–D9 của phase2.md)
 
 | # | Vấn đề | Quyết định |
 |---|---|---|
@@ -314,4 +314,4 @@ METRICS_ENABLED=false
 
 ---
 
-*Hết tài liệu Giai đoạn 3. Triển khai theo thứ tự ưu tiên mục 8; mọi sai khác so với Design Decisions (mục 4, tiếp nối D1–D9 của phase2plan_v2) phải xác nhận lại với người yêu cầu. Mọi tính năng phải giữ nguyên tắc bất biến mục 2: gated, default TẮT, tắt = baseline.*
+*Hết tài liệu Giai đoạn 3. Triển khai theo thứ tự ưu tiên mục 8; mọi sai khác so với Design Decisions (mục 4, tiếp nối D1–D9 của phase2.md) phải xác nhận lại với người yêu cầu. Mọi tính năng phải giữ nguyên tắc bất biến mục 2: gated, default TẮT, tắt = baseline.*
