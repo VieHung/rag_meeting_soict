@@ -1,14 +1,16 @@
-"""TranscriptStore — Qdrant operations cho luồng transcript (Phase 2).
+"""TranscriptStore — Qdrant operations cho luồng transcript (Phase 2 + Phase 3).
 
-Tách khỏi `QdrantService` (Phase 1) để giữ API cũ nguyên vẹn:
-- Phase 1 collection (documents): payload indexes "source"
-- Phase 2 collection (transcripts): payload indexes "meeting_id" (keyword),
-  "sequence_id" (integer), "speaker" (keyword)
-
-Vector size & distance dùng chung với Phase 1 (D6: cùng embedding model).
+Phase 3 thay đổi:
+- _physical(): tách logical collection (meeting-{uuid}) khỏi physical Qdrant collection.
+  Layout shared → tất cả cuộc họp vào 1 collection dùng chung; per_meeting là tương thích ngược.
+- point_id: uuid5(meeting_id, sequence_id) thay uuid4 → deterministic, migration idempotent.
+- ensure_collection: thêm on_disk + optimizers (ít segment lớn → ít file descriptor).
+- get_max_sequence_id: fix bug (chỉ quét 100 điểm, không filter meeting_id) → dùng
+  scroll(order_by desc, limit=1, filter=meeting_id); đúng cho collection dùng chung.
 """
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,6 +21,8 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
+    OptimizersConfigDiff,
+    OrderBy,
     PointStruct,
     Range,
     VectorParams,
@@ -30,14 +34,19 @@ from app.config import settings
 class TranscriptStore:
     """Wrap Qdrant client cho transcript points.
 
-    Singleton client per process; instance thì gắn với 1 collection cụ thể.
+    Singleton client per process. Instance mang logical collection name (meeting-{uuid})
+    và tự resolve ra physical collection qua _physical().
     """
 
     _client: Optional[QdrantClient] = None
     _collections_ready: set = set()
 
-    def __init__(self, collection_name: Optional[str] = None):
+    def __init__(self, collection_name: Optional[str] = None, meeting_id: Optional[str] = None):
         self._collection = collection_name or settings.transcript_default_collection
+        # Derive meeting_id từ tên collection nếu không truyền vào.
+        if meeting_id is None and self._collection.startswith(settings.transcript_collection_prefix):
+            meeting_id = self._collection.removeprefix(settings.transcript_collection_prefix)
+        self._meeting_id = meeting_id
         self._init_client()
 
     @classmethod
@@ -58,23 +67,47 @@ class TranscriptStore:
     def collection(self) -> str:
         return self._collection
 
+    # ---- layout resolution -----------------------------------------------
+
+    def _physical(self) -> str:
+        """Logical collection → physical Qdrant collection name theo TRANSCRIPT_STORAGE_LAYOUT."""
+        mid = self._meeting_id
+        if mid is None:
+            return self._collection
+        layout = settings.transcript_storage_layout
+        if layout == "shared":
+            return settings.transcript_shared_collection
+        if layout == "sharded":
+            # hashlib.md5 để tránh PYTHONHASHSEED salt (hash() built-in đổi sau restart).
+            h = int(hashlib.md5(mid.encode()).hexdigest(), 16)
+            return f"meeting_bucket_{h % settings.transcript_num_shards}"
+        # per_meeting — tương thích ngược tuyệt đối với Phase 1–2.
+        return f"{settings.transcript_collection_prefix}{mid}"
+
     # ---- collection management -------------------------------------------
 
     def ensure_collection(self) -> None:
-        """Tạo collection + payload index nếu chưa có."""
-        if self._collection in TranscriptStore._collections_ready:
+        """Tạo physical collection + payload index nếu chưa có."""
+        phys = self._physical()
+        if phys in TranscriptStore._collections_ready:
             return
 
         existing = {c.name for c in self.client.get_collections().collections}
-        if self._collection not in existing:
+        if phys not in existing:
             self.client.create_collection(
-                collection_name=self._collection,
+                collection_name=phys,
                 vectors_config=VectorParams(
                     size=settings.embedding_dim,
                     distance=Distance.COSINE,
+                    on_disk=settings.qdrant_on_disk,
+                ),
+                on_disk_payload=settings.qdrant_on_disk_payload,
+                optimizers_config=OptimizersConfigDiff(
+                    default_segment_number=2,
+                    max_segment_size=512_000,
+                    memmap_threshold=20_000,
                 ),
             )
-        # Best-effort tạo index cho field thường dùng để filter / scroll.
         for field, schema in (
             ("meeting_id", "keyword"),
             ("sequence_id", "integer"),
@@ -83,14 +116,13 @@ class TranscriptStore:
         ):
             try:
                 self.client.create_payload_index(
-                    collection_name=self._collection,
+                    collection_name=phys,
                     field_name=field,
                     field_schema=schema,
                 )
             except Exception:
-                # Index có thể đã tồn tại → bỏ qua.
                 pass
-        TranscriptStore._collections_ready.add(self._collection)
+        TranscriptStore._collections_ready.add(phys)
 
     # ---- ingest -----------------------------------------------------------
 
@@ -109,9 +141,10 @@ class TranscriptStore:
         context_status: str = "pending",
         context_seq_base: Optional[int] = None,
     ) -> str:
-        """Upsert 1 transcript point. Trả point_id (UUID v4)."""
+        """Upsert 1 transcript point. Trả point_id (UUID v5, deterministic)."""
         self.ensure_collection()
-        point_id = str(uuid.uuid4())
+        # uuid5 → deterministic: re-ingest cùng câu = ghi đè thay vì tạo mới.
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{meeting_id}:{sequence_id}"))
         ts = timestamp or datetime.now(timezone.utc)
         payload = {
             "meeting_id": meeting_id,
@@ -127,7 +160,7 @@ class TranscriptStore:
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         self.client.upsert(
-            collection_name=self._collection,
+            collection_name=self._physical(),
             points=[PointStruct(id=point_id, vector=vector, payload=payload)],
         )
         return point_id
@@ -146,7 +179,7 @@ class TranscriptStore:
         )
         try:
             points, _ = self.client.scroll(
-                collection_name=self._collection,
+                collection_name=self._physical(),
                 scroll_filter=flt,
                 with_payload=True,
                 with_vectors=False,
@@ -181,7 +214,7 @@ class TranscriptStore:
         next_offset = None
         while True:
             points, next_offset = self.client.scroll(
-                collection_name=self._collection,
+                collection_name=self._physical(),
                 scroll_filter=flt,
                 with_payload=True,
                 with_vectors=False,
@@ -215,7 +248,7 @@ class TranscriptStore:
         flt = Filter(must=must) if must else None
 
         results = self.client.search(
-            collection_name=self._collection,
+            collection_name=self._physical(),
             query_vector=query_vector,
             limit=top_k,
             query_filter=flt,
@@ -236,7 +269,7 @@ class TranscriptStore:
     def set_payload(self, point_id: str, payload_partial: Dict[str, Any]) -> None:
         """Cập nhật một số field payload (giữ nguyên các field khác)."""
         self.client.set_payload(
-            collection_name=self._collection,
+            collection_name=self._physical(),
             payload=payload_partial,
             points=[point_id],
             wait=True,
@@ -265,10 +298,9 @@ class TranscriptStore:
         flt = Filter(
             must=[FieldCondition(key="meeting_id", match=MatchValue(value=meeting_id))]
         )
-        # Đếm trước khi xóa (best-effort).
         try:
             count_resp = self.client.count(
-                collection_name=self._collection,
+                collection_name=self._physical(),
                 count_filter=flt,
                 exact=True,
             )
@@ -277,7 +309,7 @@ class TranscriptStore:
             count = 0
         try:
             self.client.delete(
-                collection_name=self._collection,
+                collection_name=self._physical(),
                 points_selector=flt,
                 wait=True,
             )
@@ -288,37 +320,38 @@ class TranscriptStore:
     def collection_exists(self) -> bool:
         try:
             existing = {c.name for c in self.client.get_collections().collections}
-            return self._collection in existing
+            return self._physical() in existing
         except Exception:
             return False
 
     def get_max_sequence_id(self) -> Optional[int]:
-        """Lấy sequence_id lớn nhất trong collection (dùng để rebuild counter)."""
+        """Lấy sequence_id lớn nhất của self._meeting_id (dùng để rebuild Redis counter).
+
+        Dùng scroll(order_by desc, limit=1, filter=meeting_id) — O(log N), không quét toàn bộ.
+        Yêu cầu payload index integer trên sequence_id (tạo trong ensure_collection) và
+        Qdrant >= v1.8 (server đang là v1.10.0).
+        """
+        mid = self._meeting_id
+        if mid is None:
+            return None
+        flt = Filter(
+            must=[
+                FieldCondition(key="meeting_id", match=MatchValue(value=mid)),
+                FieldCondition(key="sequence_id", range=Range(gte=1)),
+            ]
+        )
         try:
-            flt = Filter(
-                must=[
-                    FieldCondition(
-                        key="sequence_id",
-                        range=Range(gte=1),
-                    ),
-                ]
-            )
             points, _ = self.client.scroll(
-                collection_name=self._collection,
+                collection_name=self._physical(),
                 scroll_filter=flt,
                 with_payload=True,
                 with_vectors=False,
-                limit=100,
+                limit=1,
+                order_by=OrderBy(key="sequence_id", direction="desc"),
             )
             if not points:
                 return None
-            max_seq = 0
-            for p in points:
-                seq = p.payload.get("sequence_id") if p.payload else None
-                if seq is not None:
-                    seq_int = int(seq)
-                    if seq_int > max_seq:
-                        max_seq = seq_int
-            return max_seq if max_seq > 0 else None
+            seq = (points[0].payload or {}).get("sequence_id")
+            return int(seq) if seq is not None else None
         except Exception:
             return None

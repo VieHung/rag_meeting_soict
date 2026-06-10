@@ -34,6 +34,8 @@ from app.schemas.transcript import (
 )
 from app.services.context_builder import ContextBuilder
 from app.services.embedding import EmbeddingService
+from app.services.reranker import get_reranker
+from app.services.retrieval import fuse
 from app.services.sequence_manager import SequenceManager
 from app.services.transcript_store import TranscriptStore
 from app.utils.redis_client import RedisClient
@@ -169,16 +171,32 @@ class TranscriptService:
 
         window_size = self._clamp_window(request.window_size)
 
+        # Hybrid/rerank (RAGFlow-style) — gated. Khi cả hai TẮT, fetch_k == top_k
+        # và luồng y hệt bản pure-vector cũ.
+        reranker = get_reranker()
+        need_more = settings.hybrid_enabled or reranker.enabled
+        fetch_k = (
+            max(request.top_k, request.top_k * settings.hybrid_fetch_multiplier)
+            if need_more
+            else request.top_k
+        )
+
         vector = await asyncio.to_thread(self._embedder.embed_query, request.query)
         raw = await asyncio.to_thread(
             store.search,
             vector,
-            request.top_k,
+            fetch_k,
             meeting_id,
             request.speaker_filter,
             request.speaker_id_filter,
             request.score_threshold,
         )
+
+        if settings.hybrid_enabled:
+            raw = fuse(request.query, raw)
+        if reranker.enabled:
+            raw = await reranker.rerank(request.query, raw)
+        raw = raw[: request.top_k]
 
         results: List[TranscriptQueryResult] = []
         for r in raw:

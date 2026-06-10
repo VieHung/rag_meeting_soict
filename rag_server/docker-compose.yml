@@ -11,6 +11,10 @@ services:
       - ./qdrant_storage:/qdrant/storage
     environment:
       - QDRANT__SERVICE__HTTP_PORT=6333
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     restart: unless-stopped
 
   redis:
@@ -55,6 +59,10 @@ services:
     environment:
       - QDRANT_HOST=qdrant
       - REDIS_HOST=redis
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     depends_on:
       - qdrant
       - redis

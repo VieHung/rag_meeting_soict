@@ -1,11 +1,19 @@
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
-    Distance, VectorParams, PointStruct,
-    Filter, FieldCondition, MatchValue,
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    OptimizersConfigDiff,
+    PointStruct,
+    VectorParams,
 )
 from typing import List, Dict, Any, Optional
 from app.config import settings
+import logging
 import uuid
+
+logger = logging.getLogger("vector_store")
 
 
 class QdrantService:
@@ -31,6 +39,13 @@ class QdrantService:
                 vectors_config=VectorParams(
                     size=settings.embedding_dim,
                     distance=Distance.COSINE,
+                    on_disk=settings.qdrant_on_disk,
+                ),
+                on_disk_payload=settings.qdrant_on_disk_payload,
+                optimizers_config=OptimizersConfigDiff(
+                    default_segment_number=2,
+                    max_segment_size=512_000,
+                    memmap_threshold=20_000,
                 ),
             )
             self._client.create_payload_index(
@@ -38,8 +53,8 @@ class QdrantService:
                 field_name="source",
                 field_schema="keyword",
             )
-            QdrantService._collections_created.add(self._collection)
-            print(f"Created Qdrant collection: '{self._collection}'")
+            logger.info("Created Qdrant collection: '%s'", self._collection)
+        QdrantService._collections_created.add(self._collection)
 
     def upsert_chunks(
         self,
@@ -188,6 +203,13 @@ class QdrantService:
                 vectors_config=VectorParams(
                     size=settings.embedding_dim,
                     distance=Distance.COSINE,
+                    on_disk=settings.qdrant_on_disk,
+                ),
+                on_disk_payload=settings.qdrant_on_disk_payload,
+                optimizers_config=OptimizersConfigDiff(
+                    default_segment_number=2,
+                    max_segment_size=512_000,
+                    memmap_threshold=20_000,
                 ),
             )
             cls._client.create_payload_index(

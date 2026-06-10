@@ -35,6 +35,10 @@ rag_server/ollama_data/
 .DS_Store
 Thumbs.db
 
+# === Eval artifacts (regenerable benchmark outputs) ===
+eval/results/
+eval/*.log
+
 # === Design docs (no longer in use) ===
 plan.md
 rag_server/STATE.md

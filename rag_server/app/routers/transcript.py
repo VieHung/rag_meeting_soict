@@ -13,7 +13,7 @@ Các endpoint cũ đã gỡ:
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from typing import Optional
 
 from app.dependencies import get_transcript_service
@@ -27,6 +27,7 @@ from app.services.transcript_service import (
     InvalidCollectionPrefix,
     TranscriptService,
 )
+from app.workers.context_worker import get_context_worker
 
 
 router = APIRouter(prefix="/transcript", tags=["Transcript"])
@@ -54,7 +55,6 @@ def _validate_meeting_collection(collection: str) -> str:
 async def embed_transcript(
     collection: str,
     request: TranscriptEmbedRequest,
-    background_tasks: BackgroundTasks,
     service: TranscriptService = Depends(get_transcript_service),
 ):
     try:
@@ -63,7 +63,7 @@ async def embed_transcript(
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
-        response, builder, seq = await service.embed_transcript(
+        response, _builder, seq = await service.embed_transcript(
             collection=collection,
             meeting_id=meeting_id,
             request=request,
@@ -71,7 +71,9 @@ async def embed_transcript(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    background_tasks.add_task(builder.build, collection, meeting_id, seq)
+    # D9: build context tuần tự qua hàng đợi FIFO (không dùng BackgroundTasks,
+    # vốn không đảm bảo thứ tự giữa các request).
+    await get_context_worker().enqueue(collection, meeting_id, seq)
     return response
 
 
