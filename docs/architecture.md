@@ -155,6 +155,10 @@ All paths are under `rag_server/app/`.
 - One utterance = exactly **one vector** (no chunking — D4).
 - `context[N]` is the *context leading up to* utterance N (it does **not** include N itself).
 - Vector size **384**, distance **Cosine**.
+- Point IDs are **random `uuid4`** (both flows) — globally unique, so points from different
+  meetings can never collide; the trade-off is that re-ingesting the same utterance creates a
+  duplicate point (no idempotency). Phase 3 switches transcript points to deterministic
+  `uuid5(meeting_id, sequence_id)` for idempotent migration/re-ingest.
 
 ### 4.3 Redis state
 ```
@@ -231,8 +235,9 @@ From [design/phase2.md](design/phase2.md) §4, as implemented:
 Additions delivered after the original spec (RAGFlow-inspired, gated, off by default):
 - **Hybrid retrieval** (`retrieval.fuse`) and **cross-encoder reranking** (`reranker.py`),
   shared by both query flows; response shape is unchanged (only `score` reflects the final score).
-- **`/health`** checks Qdrant + Redis; **`/embed/info[/{collection}]`** wired; `print()` replaced
-  by structured logging.
+- **`/health`** checks Qdrant + Redis; **`/embed/info[/{collection}]`** wired; structured logging
+  in `main.py`/services (the background tasks in `routers/embed.py` still use `print()` — minor
+  cleanup pending).
 
 ---
 
@@ -255,12 +260,73 @@ no extra models are loaded and query behaviour is identical to pure-vector searc
 
 ---
 
-## 8. Known limitations & roadmap
+## 8. Storage partition model & scaling
 
-- **Qdrant open-file scaling** — one collection per meeting (`meeting-{uuid}`) makes the open
-  file-descriptor count grow with the number of meetings. The fix (consolidate to few physical
-  collections + `meeting_id` filter, RAGFlow-style) is specified in
-  [design/phase3.md](design/phase3.md) §S as the top-priority item.
+**Deployment snapshot** (`docker-compose.yml`, verified against code): Qdrant **v1.10.0**
+(client `qdrant-client==1.10.1` — `scroll(order_by=…)` is supported), Redis 7.2 (AOF + save),
+optional Ollama profile, and the API container. No `ulimits` are configured yet (Phase 3 S1).
+The `QdrantClient` is a **process-wide singleton** (class-level in both `QdrantService` and
+`TranscriptStore`), so the fd pressure described below comes from the Qdrant server side, not
+from client connections.
+
+A deliberate contrast with RAGFlow frames the current design and its main scaling risk.
+
+- **RAGFlow** separates *logical* partitions from the *physical* store: one index **per tenant**
+  (`ragflow_{tenant_id}`), with every knowledge base / document isolated by a **filter field**
+  (`kb_id`, `doc_id`). Index count grows with tenants (few), not with documents (many).
+- **This server** currently couples logical and physical: **one Qdrant collection per meeting**
+  (`meeting-{uuid}`). This is a side effect of D8 (derive `meeting_id` from the collection name)
+  and is the root of the scaling limitation below.
+- The document side has the same shape: the `collection` form param on `/embed/file`,
+  `/embed/text` and `POST /embed/collections` let clients create **arbitrarily many document
+  collections** (auto-created on first use). The fd math below therefore applies to `docs-*`
+  collections too, at whatever rate clients mint them.
+
+### 8.1 The "too many open files" risk (file descriptors ≠ RAM)
+
+Each Qdrant collection — even a near-empty, idle one — keeps its segment files (RocksDB `.sst`,
+mmap) **open**; Qdrant loads all collections at startup and does not close idle-collection fds.
+So:
+
+```
+file_descriptors ≈ N_meetings × segments_per_collection × files_per_segment   (grows linearly with meetings)
+```
+
+Two **orthogonal** concerns are easy to conflate:
+
+| | File descriptors (open files) | RAM (resident data) |
+|---|---|---|
+| Cause of "too many open files" | ✅ this | ❌ unrelated |
+| Idle collection (never queried) | still holds files open | vectors still resident (default) |
+| Fixed by *consolidating* collections | ✅ (segment count is capped by the merge optimizer) | partly |
+| Fixed by `on_disk`/memmap | partly | ✅ (OS page cache handles hot/cold) |
+
+The complete fix is a **package, applied together** — consolidate into few physical collections
+(`meeting_id` filter) **+** `ulimit nofile = 65535` **+** `on_disk` vectors/payload **+** an optimizer
+tuned for few large segments. Consolidation alone is not guaranteed to suffice (a single large
+collection can still exhaust fds via per-segment `.sst` files). `on_disk` gives the RAM-tiering
+("push cold data to SSD") effect for free, so no hot/warm/cold lifecycle code is needed. Migration
+**consolidates without deleting any meeting content** — it removes the empty collection shells after
+copying their points into the shared collection. The full 4-step plan (diagnose → patch foundation →
+consolidate → migrate + delete old) and its traps (e.g. globally-unique `point_id` to avoid silent
+overwrite on merge) are specified in [design/phase3.md](design/phase3.md) as the top-priority item.
+
+## 9. Other known limitations & roadmap
+
+- **`get_max_sequence_id()` is wrong past 100 points** (`transcript_store.py`) — the self-healing
+  counter rebuild scrolls a **single page of 100 points** (no pagination, no `meeting_id` filter)
+  and takes the max. For a meeting with >100 utterances whose Redis key has expired (7-day TTL),
+  the rebuilt counter can be **too low → duplicate `sequence_id`s** are then issued. This is a live
+  correctness bug independent of the storage layout; the fix
+  (`scroll(order_by=sequence_id desc, limit=1, filter=meeting_id)`, supported on Qdrant ≥ v1.8;
+  deployed server is v1.10.0) is part of Phase 3 S2.
+- **Worker durability** — `ContextWorker` uses an in-memory `asyncio.Queue`; a restart with pending
+  jobs leaves utterances stuck at `context_status="pending"`. A cheap fix is a **startup recovery
+  scan** that re-enqueues `pending`/`processing` points (their status lives in the Qdrant payload,
+  D6); see [design/phase3.md](design/phase3.md) §B1.
+- **Dead code** — `SequenceManager._ensure_collection_exists` is never called and would raise
+  `AttributeError` if it were (`QdrantService` has no instance `collection_exists` /
+  zero-arg `create_collection`); scheduled for removal in Phase 3.
 - **`LLM_API_KEY`** lives in `.env` (gitignored, untracked) but in plaintext on disk — rotate it
   and use secret injection for production.
 - **Transcript answer relevancy** is the weakest evaluated metric (~0.66) — candidate for a

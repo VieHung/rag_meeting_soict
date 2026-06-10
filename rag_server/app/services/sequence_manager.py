@@ -1,6 +1,5 @@
 """SequenceManager — atomic sequence_id per collection (Redis-backed).
 
-Theo phase2plan_v2.md:
 - Key layout: rag:seq:{collection} → INTEGER
 - Lazy init: tự khởi tạo ở lần /embed đầu tiên
 - Self-healing: rebuild từ Qdrant nếu Redis miss
@@ -31,14 +30,6 @@ class SequenceManager:
     def __init__(self, redis_client: Optional[RedisClient] = None):
         self._redis = redis_client or RedisClient()
 
-    async def _ensure_collection_exists(self, collection: str) -> None:
-        """Đảm bảo collection tồn tại trên Qdrant (lazy create)."""
-        store = TranscriptStore(collection_name=collection)
-        from app.services.vector_store import QdrantService
-        qdrant = QdrantService(collection)
-        if not qdrant.collection_exists():
-            qdrant.create_collection()
-
     async def next(self, collection: str) -> int:
         """Atomic INCR với lazy init và self-healing."""
         client = self._redis.client
@@ -52,7 +43,7 @@ class SequenceManager:
             await client.expire(seq_key, settings.seq_key_ttl_seconds)
             return int(new_val)
         except Exception as e:
-            logger.warning(f"Redis INCR failed: {e}, trying to rebuild from Qdrant")
+            logger.warning("Redis INCR failed: %s, trying to rebuild from Qdrant", e)
             return await self._rebuild_from_qdrant(collection)
 
     async def current(self, collection: str) -> int:
@@ -70,7 +61,7 @@ class SequenceManager:
         return await self._rebuild_from_qdrant(collection)
 
     async def _rebuild_from_qdrant(self, collection: str) -> int:
-        """Rebuild counter từ Qdrant (lấy max sequence_id)."""
+        """Rebuild counter từ Qdrant (lấy max sequence_id của meeting đúng)."""
         try:
             store = TranscriptStore(collection_name=collection)
             max_seq = store.get_max_sequence_id()
@@ -80,10 +71,10 @@ class SequenceManager:
             seq_key = _seq_key(collection)
             await client.set(seq_key, max_seq)
             await client.expire(seq_key, settings.seq_key_ttl_seconds)
-            logger.info(f"Rebuilt sequence counter for {collection}: {max_seq}")
+            logger.info("Rebuilt sequence counter for %s: %s", collection, max_seq)
             return int(max_seq)
         except Exception as e:
-            logger.error(f"Failed to rebuild from Qdrant: {e}")
+            logger.error("Failed to rebuild from Qdrant: %s", e)
             return settings.transcript_seq_start
 
     async def exists(self, collection: str) -> bool:

@@ -14,6 +14,7 @@ import asyncio
 import uuid
 
 import pytest
+import pytest_asyncio
 
 from app.config import settings
 from app.services.sequence_manager import SequenceManager, _seq_key
@@ -26,7 +27,7 @@ def _collection() -> str:
     return f"meeting-unittest-{uuid.uuid4().hex[:8]}"
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def redis_up():
     client = RedisClient()
     try:
@@ -38,7 +39,7 @@ async def redis_up():
     return client
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def manager(redis_up):
     yield SequenceManager(redis_up)
 

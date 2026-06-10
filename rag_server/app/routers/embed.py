@@ -1,3 +1,4 @@
+import logging
 import uuid
 import json
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks
@@ -9,6 +10,7 @@ from app.services.document_parser import DocumentParser
 from app.utils.chunking import chunk_text
 from app.config import settings
 
+logger = logging.getLogger("embed_router")
 
 router = APIRouter(prefix="/embed", tags=["Embedding"])
 
@@ -27,12 +29,12 @@ def _embed_file_background(
         qdrant = QdrantService(collection)
         text = parser.parse(file_bytes, filename, content_type or "")
         if not text.strip():
-            print(f"Skip embedding: empty parsed text for file '{filename}'")
+            logger.info("Skip embedding: empty parsed text for file '%s'", filename)
             return
 
         chunks = chunk_text(text, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
         if not chunks:
-            print(f"Skip embedding: no chunks generated for file '{filename}'")
+            logger.info("Skip embedding: no chunks generated for file '%s'", filename)
             return
 
         vectors = EmbeddingService().embed_texts(chunks)
@@ -44,9 +46,9 @@ def _embed_file_background(
             **extra_metadata,
         }
         count = qdrant.upsert_chunks(chunks, vectors, metadata)
-        print(f"Background embedded {count} chunks from file '{filename}'")
+        logger.info("Background embedded %d chunks from file '%s'", count, filename)
     except Exception as e:
-        print(f"Background embedding failed for file '{filename}': {str(e)}")
+        logger.error("Background embedding failed for file '%s': %s", filename, e)
 
 
 def _embed_text_background(
@@ -64,7 +66,7 @@ def _embed_text_background(
             overlap=settings.chunk_overlap,
         )
         if not chunks:
-            print(f"Skip embedding: no chunks generated for source '{source}'")
+            logger.info("Skip embedding: no chunks generated for source '%s'", source)
             return
 
         vectors = EmbeddingService().embed_texts(chunks)
@@ -74,9 +76,9 @@ def _embed_text_background(
             **(metadata or {}),
         }
         count = qdrant.upsert_chunks(chunks, vectors, payload_metadata)
-        print(f"Background embedded {count} chunks from source '{source}'")
+        logger.info("Background embedded %d chunks from source '%s'", count, source)
     except Exception as e:
-        print(f"Background embedding failed for source '{source}': {str(e)}")
+        logger.error("Background embedding failed for source '%s': %s", source, e)
 
 
 @router.post("/file", response_model=EmbedResponse, summary="Upload và embed tài liệu")
@@ -179,9 +181,6 @@ async def collection_info(collection: str):
 
 
 def _collection_info(collection: str):
-    # Kiểm tra tồn tại TRƯỚC khi khởi tạo QdrantService — constructor của nó
-    # tự tạo collection nếu thiếu, nên không được gọi cho collection chưa có
-    # (tránh tạo nhầm collection rỗng khi chỉ đọc info).
     if collection not in QdrantService.list_collections():
         raise HTTPException(status_code=404, detail=f"Collection '{collection}' không tồn tại")
     try:

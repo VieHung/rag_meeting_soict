@@ -1,25 +1,16 @@
 """Hybrid retrieval — fusion điểm từ khóa (BM25) + điểm vector (cosine).
 
-Lấy cảm hứng từ RAGFlow (`rag/nlp/search.py`): điểm cuối là tổ hợp có trọng số
-
-    final = vec_w * vector_sim_norm + term_w * term_sim_norm
-
-Bản tối giản cho rag_server:
-- KHÔNG re-index Qdrant, KHÔNG thêm sparse vector. BM25 chạy **trên chính tập
-  ứng viên** vector search trả về (bounded → rẻ). Đây là tinh thần "two-pass"
-  của RAGFlow rút gọn: vector lọc thô → fuse từ khóa tinh chỉnh thứ tự.
-- Dùng chung cho cả `/query/` (tài liệu) và `/query/transcript`.
-- Mặc định TẮT (settings.hybrid_enabled=False) → không đụng gì tới luồng cũ.
-
-Tokenizer tối giản, unicode-aware: lowercase + tách theo ký tự không phải chữ/số.
-Đủ để khớp tên riêng / con số / từ khóa tiếng Việt (mỗi âm tiết = 1 token).
-Không kéo `underthesea` (nặng/chậm) — có thể nâng cấp sau nếu cần segment từ ghép.
+Phase 3 A1: tokenize() trở thành pluggable qua HYBRID_TOKENIZER:
+- simple      : regex \\w+ (zero-dep, mặc định)
+- pyvi        : ViTokenizer.tokenize — segment từ ghép tiếng Việt; cần `pip install pyvi`
+- underthesea : word_tokenize — nặng hơn; cần `pip install underthesea`
+Thiếu lib → log warning + fallback về simple.
 """
 from __future__ import annotations
 
 import logging
 import re
-from typing import Dict, List
+from typing import Callable, Dict, List, Optional
 
 from app.config import settings
 
@@ -29,14 +20,62 @@ _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 try:
     from rank_bm25 import BM25Okapi  # type: ignore
-
     _HAS_BM25 = True
-except Exception:  # noqa: BLE001 — fallback nếu chưa cài rank-bm25
+except Exception:  # noqa: BLE001
     _HAS_BM25 = False
+
+# Cached tokenizer function — set lazily on first call.
+_tokenizer_fn: Optional[Callable[[str], List[str]]] = None
+
+
+def _simple_tokenize(text: str) -> List[str]:
+    return _TOKEN_RE.findall((text or "").lower())
+
+
+def _get_tokenizer() -> Callable[[str], List[str]]:
+    """Lazy-load và cache tokenizer theo HYBRID_TOKENIZER setting."""
+    global _tokenizer_fn
+    if _tokenizer_fn is not None:
+        return _tokenizer_fn
+
+    mode = settings.hybrid_tokenizer
+
+    if mode == "pyvi":
+        try:
+            from pyvi import ViTokenizer  # type: ignore
+            def _pyvi_tok(text: str) -> List[str]:
+                return _TOKEN_RE.findall(ViTokenizer.tokenize(text or "").lower())
+            _tokenizer_fn = _pyvi_tok
+            logger.info("Tokenizer: pyvi (ViTokenizer)")
+            return _tokenizer_fn
+        except ImportError:
+            logger.warning(
+                "HYBRID_TOKENIZER=pyvi but 'pyvi' is not installed — falling back to simple. "
+                "Install with: pip install pyvi"
+            )
+
+    elif mode == "underthesea":
+        try:
+            from underthesea import word_tokenize  # type: ignore
+            def _uth_tok(text: str) -> List[str]:
+                return _TOKEN_RE.findall(" ".join(word_tokenize(text or "")).lower())
+            _tokenizer_fn = _uth_tok
+            logger.info("Tokenizer: underthesea (word_tokenize)")
+            return _tokenizer_fn
+        except ImportError:
+            logger.warning(
+                "HYBRID_TOKENIZER=underthesea but 'underthesea' is not installed — falling back to simple. "
+                "Install with: pip install underthesea"
+            )
+
+    _tokenizer_fn = _simple_tokenize
+    if mode != "simple":
+        pass  # warning already logged above for unknown modes
+    return _tokenizer_fn
 
 
 def tokenize(text: str) -> List[str]:
-    return _TOKEN_RE.findall((text or "").lower())
+    return _get_tokenizer()(text)
 
 
 def _minmax_norm(values: List[float]) -> List[float]:
@@ -45,21 +84,18 @@ def _minmax_norm(values: List[float]) -> List[float]:
     lo = min(values)
     hi = max(values)
     if hi - lo < 1e-9:
-        # Tất cả bằng nhau → trả 1.0 (không phân biệt được, giữ trung tính).
         return [1.0 for _ in values]
     return [(v - lo) / (hi - lo) for v in values]
 
 
 def _bm25_scores(query: str, docs: List[str]) -> List[float]:
-    """Điểm BM25 của query trên tập docs (đã tokenize nội bộ)."""
+    """Điểm BM25 của query trên tập docs."""
     tokenized = [tokenize(d) for d in docs]
     if _HAS_BM25:
-        # Bỏ doc rỗng để BM25Okapi không chia 0 (avgdl=0).
         if not any(tokenized):
             return [0.0 for _ in docs]
         bm25 = BM25Okapi(tokenized)
         return list(bm25.get_scores(tokenize(query)))
-    # Fallback: token-overlap đếm số token query xuất hiện trong doc.
     q = set(tokenize(query))
     return [float(sum(1 for t in toks if t in q)) for toks in tokenized]
 
@@ -73,12 +109,7 @@ def fuse(
     vector_weight: float | None = None,
     term_weight: float | None = None,
 ) -> List[Dict]:
-    """Fuse điểm vector + BM25, ghi lại `score_key` = điểm cuối, sort giảm dần.
-
-    Mỗi candidate là dict có sẵn `text` và `score` (cosine từ Qdrant). Trả về
-    cùng danh sách (đã sort), `score` được thay bằng điểm fused.
-    Không phá hình dạng dict (giữ mọi field khác nguyên vẹn).
-    """
+    """Fuse điểm vector + BM25, cập nhật `score_key`, sort giảm dần."""
     if not candidates:
         return candidates
 

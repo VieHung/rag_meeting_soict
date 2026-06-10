@@ -1,317 +1,401 @@
-# Kế hoạch Giai đoạn 3 — Nâng cấp RAG: Tokenizer VN, Sparse Hybrid, PageIndex & Agentic RAG
+# Kế hoạch Giai đoạn 3 (bản rebuild) — Dứt điểm "too many open files", Độ bền worker, Tokenizer VN
 
-> **Tài liệu cho Coding Agent.** Đây là spec định hướng cho Giai đoạn 3 của hệ thống RAG
-> BKMEETING. Phần lớn tính năng ở đây là **OPTIONAL, gated qua `.env`, mặc định TẮT** —
-> tiếp nối đúng tinh thần Giai đoạn 2: *không phá endpoint, không phá tinh thần tối giản,
-> Phase 1/2 chạy nguyên vẹn khi tắt cờ.* Đọc mục 2 (nguyên tắc) trước khi code.
-
----
-
-## 1. Bối cảnh & hiện trạng (sau Giai đoạn 2 + đợt hoàn thiện 2026-06-07)
-
-Hệ thống **BKMEETING** (SOICT / NAVIS Center, ĐHBK Hà Nội) — kiến trúc 2 tầng:
-- **Tầng thiết bị (QCS8550)**: live transcript, LLM nhỏ sinh câu trả lời cho người dùng. *Ngoài phạm vi server.*
-- **Tầng server (cái này)**: RAG API + Qdrant + Redis + LLM self-host build context.
-
-**Đã có:**
-- Phase 1 (tài liệu): `/embed/*`, `/query/`.
-- Phase 2 (transcript): `/transcript/{collection}/embed`, `/query/transcript`, `/transcript/{collection}/context`, `/transcript/{collection}/segments`.
-- Đợt hoàn thiện: `context_worker.py` (FIFO build context, D9); `/embed/info`; `/health` kiểm tra dependency; logging.
-- **Nền retrieval kiểu RAGFlow đã đặt sẵn (gated, mặc định TẮT):**
-  - `app/services/retrieval.py` — hybrid fusion BM25 + vector (`HYBRID_ENABLED`).
-  - `app/services/reranker.py` — cross-encoder rerank (`RERANK_PROVIDER=none|local|http`).
-
-Giai đoạn 3 **xây tiếp trên nền này**, không làm lại từ đầu.
+> **Tài liệu cho Coding Agent.** Bản này **thay thế** Phase 3 trước đó. Thay đổi lớn nhất:
+> nhóm **S (storage)** được viết lại thành một **gói 4 bước bắt buộc làm trọn** (không còn là
+> "đổi cách lưu trữ" đơn lẻ), dựa trên xác minh thực tế cơ chế file-descriptor của Qdrant.
+> Mọi tính năng khác vẫn **OPTIONAL, gated qua `.env`, mặc định TẮT** — tắt cờ ⇒ hành vi y hệt
+> hệ thống hiện tại. Đọc mục 1 (chẩn đoán) + mục 2 (nguyên tắc) trước khi code.
+>
+> **Cập nhật 2026-06-10 — đã đối chiếu code:** các kiểm tra code-side của S0 đã có kết quả:
+> `QdrantClient` **đã singleton** (class-level ở cả `QdrantService` & `TranscriptStore`);
+> `point_id` hiện là **`uuid4`** (an toàn với gộp, nhưng không idempotent — xem Bẫy 4 đã viết
+> lại); Qdrant server **v1.10.0** + client **1.10.1** (hỗ trợ `scroll order_by`, bỏ fallback);
+> và phát hiện **bug có sẵn** trong `get_max_sequence_id()` (quét 1 trang 100 điểm, không
+> phân trang, không filter `meeting_id` — xem S2d). S0 còn lại chỉ là **đo fd trên host**.
 
 ---
 
-## 2. Nguyên tắc bất biến (giữ nguyên từ Phase 2)
+## 1. Bối cảnh & chẩn đoán cốt lõi
 
-1. **Không thêm/đổi đường dẫn endpoint hiện có**; không đổi hình dạng response (chỉ `score` phản ánh điểm cuối). Tính năng mới = chế độ bật/tắt bên trong endpoint cũ, hoặc endpoint **mới hoàn toàn tách biệt** nếu thật sự cần (giải trình rõ).
-2. **Gated + default TẮT**: mỗi tính năng có cờ `.env`; tắt cờ → hành vi y hệt hiện tại, không thêm dependency nặng, không thêm chi phí.
-3. **Tôn trọng kiến trúc 2 tầng**: server là *nguồn tri thức*. Logic *điều phối agent* ưu tiên đặt ở **tầng thiết bị**; server chỉ cung cấp công cụ truy vấn tốt.
-4. **1 collection = 1 cuộc họp**; `meeting_id` suy từ tên collection; Phase 1 (`docs-*`) và Phase 2 (`meeting-*`) tách biệt.
-5. **Đo trước khi mở rộng**: tính năng nặng (PageIndex, Agentic) chỉ bật khi có dữ liệu thực chứng minh giá trị.
+**BKMEETING** (SoICT / NAVIS Center, ĐHBK Hà Nội) — kiến trúc **2 tầng**:
+- **Thiết bị (QCS8550)**: live transcript + LLM nhỏ **sinh câu trả lời cho người dùng**. *Ngoài phạm vi server.*
+- **Server (repo này)**: **nguồn tri thức** — RAG API + Qdrant + Redis + LLM self-host build context.
 
----
+**Đã có** (Phase 1 + 2 + đợt hoàn thiện): 2 luồng tài liệu/transcript; `context_worker.py` (FIFO, D9);
+hybrid retrieval + reranker (gated, off); `/health`, `/embed/info`, logging; benchmark RAGAS.
 
-## 3. Phạm vi
+### 1.1. Vấn đề #1 (blocker): Qdrant "too many open files"
 
-### 3.1. IN SCOPE (xếp theo ưu tiên — làm từ trên xuống)
+Thiết kế hiện tại dùng **1 collection vật lý / 1 cuộc họp** (`meeting-{uuid}`). Đây là hệ quả vô tình
+của D8 ("`meeting_id` suy từ tên collection") → **logical = physical**. RAGFlow đi hướng ngược lại
+ngay từ đầu: **1 index / 1 tenant** + filter `kb_id` (logical ≠ physical). Hệ quả của ta:
 
-| Nhóm | Tính năng | Ưu tiên | Tác động endpoint |
-|---|---|---|---|
-| **S** | **Hợp nhất storage — chống "too many open files"** (tách tên logic khỏi collection vật lý, filter theo `meeting_id`) | 🔴🔴 Blocker | Không — endpoint giữ nguyên, chỉ đổi lưu trữ bên trong |
-| **A1** | Tokenizer tiếng Việt cho hybrid (pyvi/underthesea) | 🔴 Cao | Không — nâng chất lượng `fuse()` |
-| **A2** | Sparse vector native trên Qdrant (BM25/SPLADE) + RRF fusion | 🟡 TB | Không — chế độ retrieval thay thế in-process BM25 |
-| **B1** | Context worker **per-collection** (song song nhiều cuộc họp, vẫn FIFO trong từng cuộc) | 🟡 TB | Không |
-| **B2** | Batch build context (gộp nhiều câu / 1 lần gọi LLM) | 🟢 Thấp | Không |
-| **C** | **PageIndex** cho luồng tài liệu (`docs-*`) — cây mục lục, retrieval reasoning-based | 🟡 TB | `/query/` thêm chế độ; ingest dựng cây |
-| **D** | **Agentic RAG** — điều phối multi-hop trên cả docs + transcript | 🟢 Thấp/Optional | Ưu tiên ở tầng thiết bị; server tùy chọn `/query/agentic` |
-| **E** | Production hardening: auth nội bộ, metrics, rate limit, rotate key | 🟡 TB | Middleware, không đổi path |
-
-### 3.2. OUT OF SCOPE
-- Không xây UI / phần app workstation.
-- Không thay embedding model nền (giữ MiniLM-384) trừ khi A2 yêu cầu thêm sparse model riêng.
-- Không bê nguyên GraphRAG/community detection của RAGFlow (quá nặng cho on-device meeting).
-- Không phá luồng Phase 1/2 khi mọi cờ TẮT.
-
----
-
-## 4. Quyết định Kiến trúc (tiếp nối D1–D9 của phase2.md)
-
-| # | Vấn đề | Quyết định |
-|---|---|---|
-| **D16** | Chống vỡ giới hạn file mở của Qdrant | Học mô hình RAGFlow (`index_name(tenant)` + filter `kb_id`): **tách tên collection logic (API) khỏi collection vật lý**. Nhiều cuộc họp dồn vào **ít collection vật lý dùng chung**, cô lập bằng filter `meeting_id` (đã có sẵn payload index). Số file mở tỉ lệ với **số bucket cố định**, KHÔNG với số cuộc họp. |
-| **D17** | Bố cục vật lý | Mặc định **`shared`**: tất cả transcript trong 1 collection `meeting_transcripts` (filter `meeting_id`). Tùy chọn **`sharded`**: `meeting_bucket_{h}`, `h = stable_hash(meeting_id) % TRANSCRIPT_NUM_SHARDS` (vd 8/16) khi 1 collection quá lớn. Tùy chọn **`per_meeting`**: giữ hành vi cũ (1 collection/cuộc) cho ai cần cô lập tuyệt đối — KHÔNG khuyến nghị ở quy mô lớn. |
-| **D18** | Giữ hợp đồng API | Endpoint vẫn `/transcript/meeting-{uuid}/...`; `meeting_id` suy từ tên như cũ. Thêm lớp `resolve_physical(meeting_id) -> (collection, filter)` trong `TranscriptStore`/service. `get_max_sequence_id()` PHẢI filter theo `meeting_id` khi `shared/sharded`. Sequence key Redis vẫn theo `meeting_id` (đã duy nhất). Xóa cuộc họp = `delete_by_meeting_id` (đã có `TranscriptStore.delete_meeting`), KHÔNG drop collection. |
-| **D19** | Doc-store trừu tượng (định hướng) | Cân nhắc tách `VectorBackend` interface (như `DocStoreConnection` của RAGFlow) để sau này đổi/đặt cạnh engine khác (Infinity/ES) mà không sửa business logic. Phase 3 chỉ chuẩn bị interface mỏng quanh Qdrant, chưa đổi engine. |
-| **D10** | Tokenize tiếng Việt cho BM25 | Thêm lớp tokenizer cắm được: `simple` (hiện tại) \| `pyvi` \| `underthesea`. Cấu hình `HYBRID_TOKENIZER`. Mặc định `simple` (zero-dep). Load lười, fallback `simple` nếu thư viện thiếu. |
-| **D11** | Sparse hybrid trên Qdrant | Khi `HYBRID_MODE=qdrant_sparse`: thêm **named sparse vector** vào điểm Qdrant lúc ingest, query dùng Qdrant Query API (prefetch dense + sparse → fusion RRF). Khi `HYBRID_MODE=inprocess` (mặc định) → giữ BM25 in-process hiện tại, **không re-index**. |
-| **D12** | Worker per-collection | Thay 1 hàng đợi global bằng **dict hàng đợi theo collection** + worker pool có giới hạn; trong mỗi collection vẫn FIFO (giữ D9). Số worker đồng thời tối đa = `CONTEXT_WORKER_CONCURRENCY`. |
-| **D13** | PageIndex là *thêm*, không *thay* | PageIndex là **chế độ retrieval phụ** cho `docs-*`, bật bằng `DOCS_RETRIEVAL_MODE=pageindex`. Cây mục lục lưu thành **điểm metadata đặc biệt** trong cùng collection (`kind="toc_node"`), không cần store mới. Tắt → `/query/` chạy vector như cũ. |
-| **D14** | Agentic đặt ở đâu | **Ưu tiên tầng thiết bị** điều phối (gọi tuần tự/lặp `/query/` + `/query/transcript`). Server **chỉ** thêm endpoint `/query/agentic` khi team yêu cầu chạy agent phía server — mặc định **không** bật (`AGENTIC_ENABLED=false`). Giữ server là nguồn tri thức gọn. |
-| **D15** | Tương thích ngược tuyệt đối | Mọi cờ TẮT ⇒ nhị phân hành vi == hệ thống sau đợt 2026-06-07. CI phải có 1 suite chạy với toàn bộ cờ tắt để khẳng định điều này. |
-
----
-
-## 5. Đặc tả từng nhóm
-
-### S — Hợp nhất storage chống "too many open files" (🔴🔴 BLOCKER — làm TRƯỚC)
-
-**Vì sao (vấn đề thực)**: thiết kế v2 dùng **1 Qdrant collection / 1 cuộc họp** (`meeting-{uuid}`) + `docs-{uuid}`. Mỗi collection giữ segment + file mmap riêng → **số file mở (file descriptor) tỉ lệ với số cuộc họp**. Khi tích lũy nhiều cuộc họp, server vượt `ulimit -n` → lỗi *"too many open files"*, Qdrant từ chối mở segment.
-
-**Bài học RAGFlow** (`rag/nlp/search.py:34`, `common/doc_store/`): RAGFlow tạo **1 index / 1 tenant** (`ragflow_{tenant_id}`), mọi knowledge base/doc nằm chung index, **phân tách bằng filter `kb_id`/`doc_id`** — số index tỉ lệ với số tenant (ít), không với số KB (nhiều). Ta áp đúng nguyên lý: **partition logic ≠ collection vật lý.**
-
-**Cách làm** (giữ endpoint y nguyên — chỉ đổi lưu trữ bên trong):
-1. **Lớp resolve logical→physical**: thêm `TranscriptStore._physical(meeting_id) -> str` theo `TRANSCRIPT_STORAGE_LAYOUT`:
-   - `shared` (mặc định): trả `TRANSCRIPT_SHARED_COLLECTION` (vd `meeting_transcripts`).
-   - `sharded`: trả `meeting_bucket_{stable_hash(meeting_id) % TRANSCRIPT_NUM_SHARDS}`.
-   - `per_meeting`: trả `meeting-{meeting_id}` (hành vi cũ — tương thích ngược).
-2. **Mọi thao tác filter theo `meeting_id`** — `TranscriptStore.search/scroll_window/find_by_seq` **đã** filter sẵn ✅. Chỉ cần:
-   - `upsert_point`: dùng collection vật lý từ `_physical`.
-   - `get_max_sequence_id(meeting_id)`: **thêm filter `meeting_id`** (hiện đang quét cả collection — sai khi dùng chung).
-   - `ensure_collection`: tạo **collection vật lý dùng chung** 1 lần (idempotent), payload index `meeting_id`(keyword)/`sequence_id`(integer)/`speaker`.
-   - `delete_meeting(meeting_id)`: đã có — xóa theo filter, **không** drop collection.
-3. **SequenceManager**: key Redis vẫn `rag:seq:{meeting_id}` (uuid duy nhất → không đụng nhau dù chung collection). Rebuild gọi `get_max_sequence_id(meeting_id)`.
-4. **Migration**: script gộp các collection `meeting-*` cũ vào collection dùng chung (scroll → re-upsert kèm `meeting_id`), rồi `delete_collection` cái cũ. Idempotent, chạy được nhiều lần. `per_meeting` cho ai chưa muốn migrate.
-5. **(Tùy chọn) Phase 1 docs**: cùng nguyên lý — gộp `docs-*` vào ít collection + filter `source`/`doc_id`. Xâm lấn hơn (app tự đặt tên collection) → để **giai đoạn sau**, ngoài scope bắt buộc của nhóm S.
-
-**Mitigation bổ sung (làm song song, rẻ)**: nâng `ulimit -n` (vd 65535) trong `docker-compose.yml` (`ulimits.nofile`); cân nhắc Qdrant `on_disk_payload`, giảm số segment. Đây là *giảm nhẹ*, không thay cho hợp nhất.
-
-**Config**: `TRANSCRIPT_STORAGE_LAYOUT=shared` (default) | `sharded` | `per_meeting`; `TRANSCRIPT_SHARED_COLLECTION=meeting_transcripts`; `TRANSCRIPT_NUM_SHARDS=8`.
-
-**Lưu ý hiệu năng**: collection dùng chung cần payload index `meeting_id` tốt (đã có). Qdrant xử lý hàng triệu điểm/collection tốt; filter `meeting_id` rẻ. `sharded` dùng khi 1 collection phình quá lớn hoặc muốn phân tán.
-
-**DoD nhóm S**:
-- [ ] Tạo 100+ "cuộc họp" (meeting_id khác nhau) → **số collection Qdrant không tăng theo** (1 với `shared`, ≤N với `sharded`).
-- [ ] Embed/query/context/segments/delete của từng cuộc vẫn đúng & cô lập (không lẫn dữ liệu cuộc khác).
-- [ ] `get_max_sequence_id` trả max **theo meeting_id**, không phải max toàn collection → sequence rebuild đúng.
-- [ ] `per_meeting` cho hành vi y hệt v2 (tương thích ngược).
-- [ ] Script migration gộp collection cũ chạy idempotent, dữ liệu không mất.
-
----
-
-### A1 — Tokenizer tiếng Việt (🔴 ưu tiên cao nhất, rủi ro thấp)
-
-**Vì sao**: `retrieval.tokenize()` hiện cắt theo âm tiết (`\w+`), nên BM25 không khớp **từ ghép** ("ngân sách", "vận hành", "tuyển dụng"). Segment từ ghép → khớp cụm chính xác hơn nhiều, đúng nhu cầu giữ tên riêng/thuật ngữ.
-
-**Cách làm**:
-- `app/services/retrieval.py`: trừu tượng hóa `tokenize()` theo `settings.hybrid_tokenizer`:
-  - `simple`: như hiện tại (mặc định, zero-dep).
-  - `pyvi`: `from pyvi import ViTokenizer` → `ViTokenizer.tokenize(text)` rồi split.
-  - `underthesea`: `word_tokenize(text)` (nặng/chậm hơn, chính xác hơn).
-- Load lười + cache; thiếu thư viện → log cảnh báo, fallback `simple`.
-- `requirements.txt`: `pyvi` đặt **optional** (extras hoặc comment hướng dẫn cài khi cần).
-
-**Config**: `HYBRID_TOKENIZER=simple` (default).
-**DoD**: query "ngân sách quý 4" khớp câu chứa cụm "ngân sách" tốt hơn baseline; tắt/đổi tokenizer không lỗi.
-
----
-
-### A2 — Sparse hybrid native trên Qdrant (🟡)
-
-**Vì sao**: BM25 in-process chỉ re-rank trên ứng viên vector trả về → **không cứu được** câu mà vector search trượt ngay từ đầu. Sparse vector index toàn bộ collection → bắt được khớp từ khóa thuần.
-
-**Cách làm**:
-- Sinh sparse vector (BM25/SPLADE) lúc ingest (`/embed/*` và `/transcript/embed`), thêm **named vector** `"sparse"` vào `PointStruct`. Cần đổi `vectors_config` của collection sang dạng named (dense + sparse) — **chỉ áp cho collection tạo mới khi `HYBRID_MODE=qdrant_sparse`**; collection cũ vẫn dùng `inprocess`.
-- Query: Qdrant **Query API** với `prefetch` (dense KNN + sparse) và `fusion=RRF`. Bọc trong `retrieval.py` để router không đổi.
-- Giữ `inprocess` làm mặc định để không buộc re-index dữ liệu hiện có.
-
-**Config**: `HYBRID_MODE=inprocess` (default) | `qdrant_sparse`.
-**Lưu ý**: cần qdrant-client hỗ trợ sparse (đã có từ ≥1.7). Kiểm tra version trong `requirements.txt`.
-**DoD**: với `qdrant_sparse`, truy vấn chỉ-từ-khóa (tên riêng hiếm) tìm thấy câu mà chế độ vector-only bỏ lỡ.
-
----
-
-### B1 — Context worker per-collection (🟡)
-
-**Vì sao**: worker hiện là 1 hàng đợi FIFO **global** → nhiều cuộc họp song song bị serialize chung, build context cuộc B phải chờ cuộc A. Khi triển khai nhiều phòng họp đồng thời, độ trễ context tăng.
-
-**Cách làm** (`app/workers/context_worker.py`):
-- Thay 1 queue bằng **dict `{collection: asyncio.Queue}`** + một semaphore `CONTEXT_WORKER_CONCURRENCY`.
-- Mỗi collection có **một** consumer task (đảm bảo FIFO trong cuộc — giữ D9); nhiều collection chạy song song tới mức semaphore.
-- Dọn queue/task của collection khi idle quá `WORKER_IDLE_TTL` để tránh rò rỉ.
-- `stop()` drain tất cả queue.
-
-**Config**: `CONTEXT_WORKER_CONCURRENCY=4`.
-**DoD**: embed song song 2 cuộc họp → context cả hai build đồng thời; thứ tự trong từng cuộc vẫn đúng (1..N).
-
----
-
-### B2 — Batch build context (🟢)
-
-**Vì sao**: khi người ta nói nhanh, mỗi câu 1 lần gọi LLM gây dồn tải. Gộp `k` câu liên tiếp thành 1 lần tóm tắt giảm số lần gọi.
-
-**Cách làm**: worker gom job cùng collection trong cửa sổ thời gian ngắn (`BATCH_WINDOW_MS`) hoặc tới `BATCH_MAX`; build context cho mốc mới nhất, các câu trung gian kế thừa. Giữ định nghĩa `context[N]` nhất quán (bối cảnh dẫn tới câu N).
-**Config**: `CONTEXT_BATCH_ENABLED=false`, `CONTEXT_BATCH_WINDOW_MS=500`, `CONTEXT_BATCH_MAX=5`.
-**DoD**: tốc độ nói cao → số lần gọi LLM giảm rõ, chất lượng context không tụt đáng kể.
-
----
-
-### C — PageIndex cho luồng tài liệu (🟡, optional)
-
-**Vì sao**: tài liệu họp dài/có cấu trúc (báo cáo, quy chế) bị chunking + vector làm "vỡ" mạch; vector hay trượt câu hỏi cần đọc theo mục. PageIndex dựng **cây mục lục** rồi để LLM điều hướng tới đúng nhánh (reasoning-based, vectorless ở bước định vị).
-
-**Cách làm** (chỉ cho `docs-*`, gated):
-- **Ingest** (`/embed/file` khi `DOCS_PAGEINDEX_ON_INGEST=true`): sau parse, dùng LLM gán cấp mục lục (tham khảo prompt `assign_toc_levels` của RAGFlow) → lưu các **node TOC** thành điểm metadata `kind="toc_node"` (title, level, parent, chunk refs) trong cùng collection.
-- **Query** (`/query/` khi `DOCS_RETRIEVAL_MODE=pageindex`): LLM "lật" cây TOC chọn nhánh liên quan → lấy chunk con của nhánh đó (kết hợp/không vector). Trả **đúng schema `QueryResult` cũ**.
-- Tắt cờ → `/query/` vector như cũ; node TOC bị bỏ qua khi search thường (filter `kind != "toc_node"`).
-
-**Config**: `DOCS_RETRIEVAL_MODE=vector` (default) | `pageindex`; `DOCS_PAGEINDEX_ON_INGEST=false`.
-**Reuse**: `LLMClient` sẵn có; mẫu prompt TOC của RAGFlow (`rag/prompts/assign_toc_levels.md`).
-**DoD**: với tài liệu dài có mục lục, câu hỏi "mục X quy định gì" trả đúng đoạn theo cấu trúc, tốt hơn vector-only.
-
----
-
-### D — Agentic RAG (🟢, optional, ưu tiên tầng thiết bị)
-
-**Vì sao**: câu hỏi khó cần multi-hop hoặc ghép cả tài liệu lẫn transcript (vd "so quyết định ngân sách trong họp với đề xuất ban đầu trong tài liệu"). Agent tự lập kế hoạch → chọn luồng → lặp truy vấn → tổng hợp.
-
-**Quyết định kiến trúc (D14)**:
-- **Mặc định**: agent **chạy ở tầng thiết bị QCS8550**, điều phối gọi 2 endpoint server sẵn có (`/query/`, `/query/transcript`). Server **không cần thay đổi** → giữ gọn, đúng 2 tầng.
-- **Optional server-side**: nếu team muốn agent phía server, thêm endpoint **mới, tách biệt** `POST /query/agentic` (gated `AGENTIC_ENABLED=true`):
-  - Vòng lặp: phân rã câu hỏi → chọn tool (`search_docs` / `search_transcript`) → gọi nội bộ retrieval đã có → tự đánh giá đủ chưa (tối đa `AGENTIC_MAX_STEPS`) → tổng hợp + trích nguồn.
-  - Tham khảo `DeepResearcher` + `agent/` của RAGFlow ở mức ý tưởng, **không** bê framework.
-- Response của `/query/agentic` là endpoint mới (không đụng `/query/` cũ).
-
-**Config**: `AGENTIC_ENABLED=false`, `AGENTIC_MAX_STEPS=4`, `AGENTIC_LLM_*` (có thể tách model khác build-context).
-**Cảnh báo**: đây là tính năng dễ "rườm rà" & tốn LLM nhất — chỉ làm khi có nhu cầu thực và đã đo lợi ích.
-**DoD**: câu hỏi multi-hop ghép docs+transcript được trả lời kèm trích nguồn; tắt cờ → endpoint không tồn tại, hệ thống như cũ.
-
----
-
-### E — Production hardening (🟡)
-
-- **Rotate `LLM_API_KEY`** đang lộ plaintext; chuyển sang Docker secret / env injection.
-- **Auth nội bộ**: API key/header giữa thiết bị và server (hiện CORS `*`, không auth). Middleware gated `INTERNAL_API_KEY`.
-- **Rate limit + giới hạn kích thước** cho `/embed/text`, `/transcript/embed`, `/query/*`.
-- **Metrics/observability**: thời gian build context, độ trễ query, tỉ lệ `context_status=failed`, độ sâu agent. Xuất Prometheus hoặc log có cấu trúc.
-- **/health** mở rộng: thêm trạng thái worker (số queue, backlog).
-
----
-
-## 6. File dự kiến tạo / sửa
-
-**Tạo mới**
-- `scripts/migrate_collections.py` — gộp `meeting-*` cũ vào collection dùng chung (nhóm S, idempotent)
-- `app/services/pageindex.py` — dựng cây TOC + retrieval reasoning-based (nhóm C)
-- `app/services/agentic.py` — vòng lặp agent + tool calling (nhóm D, nếu bật server-side)
-- `app/routers/query.py` — (nếu D server-side) thêm `POST /query/agentic`
-- `app/middleware/auth.py`, `app/middleware/ratelimit.py` (nhóm E)
-- `app/utils/metrics.py` (nhóm E)
-
-**Sửa**
-- `app/services/transcript_store.py` — lớp `_physical(meeting_id)`; filter `meeting_id` cho `get_max_sequence_id`; `ensure_collection` dùng chung (nhóm S)
-- `app/services/transcript_service.py` / `sequence_manager.py` — gọi store theo `meeting_id` thay vì tên collection logic (nhóm S)
-- `docker-compose.yml` — `ulimits.nofile` cho qdrant + rag_api (nhóm S, mitigation)
-- `app/services/retrieval.py` — tokenizer cắm được (A1); chế độ `qdrant_sparse` (A2)
-- `app/services/embedding.py` / `transcript_store.py` / `vector_store.py` — sinh + lưu sparse vector (A2); filter `kind` (C)
-- `app/workers/context_worker.py` — per-collection + concurrency (B1); batch (B2)
-- `app/config.py` — toàn bộ cờ mục 7
-- `app/main.py` — middleware auth/ratelimit/metrics; mở rộng /health
-- `.env.example`, `rag_server/README.md`, `STATE.md` — đồng bộ
-- `requirements.txt` — `pyvi` (optional); kiểm tra qdrant-client hỗ trợ sparse
-
----
-
-## 7. Cấu hình `.env` mới (tất cả mặc định = hành vi cũ)
-
-```ini
-# === S: Hợp nhất storage (chống too-many-open-files) ===
-TRANSCRIPT_STORAGE_LAYOUT=shared       # shared | sharded | per_meeting
-TRANSCRIPT_SHARED_COLLECTION=meeting_transcripts
-TRANSCRIPT_NUM_SHARDS=8                 # chỉ dùng khi layout=sharded
-
-# === A1: Tokenizer hybrid ===
-HYBRID_TOKENIZER=simple            # simple | pyvi | underthesea
-
-# === A2: Sparse hybrid ===
-HYBRID_MODE=inprocess              # inprocess | qdrant_sparse
-
-# === B1/B2: Context worker ===
-CONTEXT_WORKER_CONCURRENCY=4
-CONTEXT_BATCH_ENABLED=false
-CONTEXT_BATCH_WINDOW_MS=500
-CONTEXT_BATCH_MAX=5
-
-# === C: PageIndex (docs) ===
-DOCS_RETRIEVAL_MODE=vector         # vector | pageindex
-DOCS_PAGEINDEX_ON_INGEST=false
-
-# === D: Agentic RAG (server-side, optional) ===
-AGENTIC_ENABLED=false
-AGENTIC_MAX_STEPS=4
-
-# === E: Hardening ===
-INTERNAL_API_KEY=                  # rỗng = tắt auth (giữ tương thích)
-RATE_LIMIT_ENABLED=false
-METRICS_ENABLED=false
+```
+fd ≈ N_meetings × segments_per_collection × files_per_segment   → tăng TUYẾN TÍNH theo số cuộc họp
 ```
 
----
+Mỗi collection (kể cả gần rỗng) luôn có ≥ vài segment, mỗi segment giữ nhiều file (RocksDB `.sst`,
+mmap) **ở trạng thái MỞ**. Qdrant nạp toàn bộ collection lúc khởi động và **không tự đóng fd của
+collection nhàn rỗi**. Tích lũy đủ cuộc họp → vượt `ulimit -n` → Qdrant từ chối mở segment.
 
-## 8. Danh sách công việc (theo thứ tự ưu tiên)
+> Hướng giải đã được **Qdrant maintainer xác nhận**: Qdrant *không thể* giới hạn số file mở; cách
+> đúng là **dồn về một collection** — càng nhiều collection càng tốn fd, và họ khuyến nghị **không**
+> tạo nhiều collection nhỏ.
 
-> Mỗi task 1 commit/PR riêng, kèm test cờ-tắt-bằng-baseline.
+### 1.2. Phân biệt sống còn: **file-descriptor (fd) ≠ RAM** (trực giao)
 
-**Task 0 — S Hợp nhất storage (LÀM TRƯỚC, blocker)**: lớp `_physical(meeting_id)` trong `TranscriptStore`; filter `meeting_id` cho `get_max_sequence_id`; `ensure_collection` dùng chung; nâng `ulimit nofile` trong compose; script migration gộp `meeting-*`; test 100+ meeting → số collection không tăng. Mặc định `shared`; `per_meeting` cho tương thích ngược.
-**Task 1 — A1 Tokenizer VN**: tokenizer cắm được trong `retrieval.py`; pyvi optional; unit test khớp cụm từ.
-**Task 2 — B1 Worker per-collection**: refactor `context_worker.py`; test 2 cuộc họp song song giữ thứ tự.
-**Task 3 — A2 Sparse hybrid**: sparse vector lúc ingest + Query API RRF; chỉ collection mới; test khớp từ khóa hiếm.
-**Task 4 — C PageIndex**: dựng cây TOC khi ingest + retrieval theo cây; gated; test tài liệu dài.
-**Task 5 — E Hardening**: auth + rate limit + metrics; rotate key; mở rộng /health.
-**Task 6 — B2 Batch context** (nếu cần sau khi đo tải): gộp job.
-**Task 7 — D Agentic** (chỉ khi team yêu cầu): `/query/agentic` server-side; hoặc tài liệu hướng dẫn agent ở tầng thiết bị.
-**Task 8 — Tài liệu & CI**: cập nhật README/STATE; suite "all-flags-off == baseline".
+Đây là điểm dễ hiểu nhầm và làm lệch cả hướng giải:
 
----
+| | **fd (số file đang MỞ)** | **RAM (cái gì trong bộ nhớ)** |
+|---|---|---|
+| Bản chất lỗi "too many open files" | ✅ chính là đây | ❌ không liên quan |
+| Collection nhàn rỗi (không ai query 1 tháng) | **vẫn giữ file mở** → vẫn tốn fd | vector vẫn chiếm RAM (config mặc định) |
+| "Đẩy dữ liệu cũ xuống disk" giải quyết? | ❌ KHÔNG — file vẫn mở | ✅ CÓ — đỡ RAM |
+| "Hợp nhất collection" giải quyết? | ✅ CÓ — số segment có trần nhờ merge optimizer | một phần |
+| `on_disk=True` (memmap) giải quyết? | một phần | ✅ CÓ — OS page cache lo hot/cold tự động |
 
-## 9. Tiêu chí hoàn thành tổng (DoD)
+**Hệ quả thiết kế:**
+- **Hợp nhất collection** chữa **fd** (số segment do merge optimizer quản, có trần theo dung lượng, không theo số cuộc).
+- **`on_disk`/memmap** chữa **RAM** — và cho **đúng hiệu ứng "tier nóng/nguội"** mà không cần xây
+  pipeline lifecycle nào: vector cuộc cũ không nạp RAM tới khi bị query; kernel page-cache quyết định
+  nóng/nguội ở mức trang, mịn và tự điều chỉnh hơn mọi ngưỡng "X ngày không dùng".
+- ⇒ **Không phải chọn giữa "xóa" và "đẩy xuống disk".** Migration **không xóa nội dung** cuộc họp
+  (chỉ xóa *vỏ collection rỗng* sau khi copy điểm sang collection chung — dữ liệu vẫn query được).
+  `on_disk` lo phần tiering. Cold-tier rời Qdrant là **YAGNI** (xem §4.5).
 
-- [ ] Mọi cờ mục 7 TẮT ⇒ hành vi == hệ thống sau đợt 2026-06-07 (suite baseline pass). *(Ngoại lệ: `TRANSCRIPT_STORAGE_LAYOUT` mặc định `shared` đổi cách lưu vật lý — đặt `per_meeting` để bằng baseline tuyệt đối.)*
-- [ ] **S**: tạo 100+ meeting → số collection Qdrant KHÔNG tăng theo (1 với `shared`, ≤N với `sharded`); dữ liệu từng cuộc cô lập; `get_max_sequence_id` filter đúng `meeting_id`; migration idempotent không mất dữ liệu; `per_meeting` == baseline.
-- [ ] A1: đổi `HYBRID_TOKENIZER` cải thiện khớp cụm tiếng Việt, không lỗi khi thiếu thư viện.
-- [ ] B1: nhiều cuộc họp build context song song; FIFO trong từng cuộc giữ nguyên (D9).
-- [ ] A2: `qdrant_sparse` bắt được câu khớp-từ-khóa mà vector-only trượt; collection cũ không bị buộc re-index.
-- [ ] C: `pageindex` trả đúng đoạn theo cấu trúc cho tài liệu dài; tắt → `/query/` vector như cũ; node TOC không lẫn vào kết quả thường.
-- [ ] D: (nếu bật) `/query/agentic` trả lời multi-hop kèm trích nguồn; tắt → endpoint không tồn tại.
-- [ ] E: auth/rate-limit/metrics bật được mà không phá client cũ khi tắt.
-- [ ] Phase 1/2 + 4 endpoint transcript + `/docs` không phát sinh thay đổi ngoài ý muốn.
+### 1.3. Công thức dứt điểm (làm CÙNG LÚC, không phải "chọn một")
 
----
-
-## 10. Câu hỏi mở (chốt với team trước khi code từng nhóm)
-
-0. **Bố cục storage (nhóm S)**: chọn `shared` (1 collection, đơn giản nhất) hay `sharded` (N bucket, phân tán)? Ước lượng số cuộc họp/tháng & tổng tích lũy để chọn N. Có cần migrate dữ liệu `meeting-*` hiện có hay chấp nhận `per_meeting` cho dữ liệu cũ + `shared` cho cuộc mới?
-0b. **Đa tenant**: một server có phục vụ nhiều tổ chức không? Nếu có, cân nhắc thêm `tenant_id` vào tên collection vật lý (giống `ragflow_{tenant}`) để cô lập theo tenant.
-0c. **Docs `docs-*`**: có gộp luôn không, hay để giai đoạn sau? (xâm lấn hơn vì app tự đặt tên collection).
-1. **A2 vs A1**: nếu A1 (tokenizer) đã đủ tốt cho nhu cầu thực, có cần A2 (sparse native, tốn re-index) không?
-2. **PageIndex**: tài liệu họp thực tế có dài & có mục lục rõ không? Nếu phần lớn ngắn → bỏ nhóm C.
-3. **Agentic ở đâu**: team muốn agent ở thiết bị (giữ server gọn) hay phía server (`/query/agentic`)? → quyết định có làm `app/services/agentic.py` không.
-4. **LLM cho agent/PageIndex**: dùng chung model build-context hay tách model mạnh hơn? Ảnh hưởng VRAM server.
-5. **Auth**: mức độ bảo mật giữa thiết bị–server (chỉ API key, hay mTLS)?
+```
+HỢP NHẤT collection  +  ulimit nofile = 65535  +  on_disk vector/payload  +  ít segment lớn
+```
+Chỉ làm một trong số đó **chưa chắc khỏi** — vì một collection lớn vẫn có thể đụng lỗi (xem Bẫy 2, §4.4).
 
 ---
 
-*Hết tài liệu Giai đoạn 3. Triển khai theo thứ tự ưu tiên mục 8; mọi sai khác so với Design Decisions (mục 4, tiếp nối D1–D9 của phase2.md) phải xác nhận lại với người yêu cầu. Mọi tính năng phải giữ nguyên tắc bất biến mục 2: gated, default TẮT, tắt = baseline.*
+## 2. Nguyên tắc bất biến (giữ từ Phase 2)
+
+1. **Không đổi đường dẫn endpoint**; không đổi hình dạng response (chỉ `score` phản ánh điểm cuối).
+   Tính năng mới = cờ bật/tắt trong endpoint cũ, hoặc endpoint **mới tách biệt** (nếu thật sự cần).
+2. **Gated + default TẮT** — tắt cờ ⇒ hành vi & dependency y hệt hiện tại.
+3. **Tôn trọng 2 tầng** — server là *nguồn tri thức*; điều phối agent ưu tiên đặt ở **thiết bị**.
+4. **Đo trước khi mở rộng** — tính năng nặng chỉ bật khi có dữ liệu chứng minh.
+5. **Tương thích ngược** — có chế độ `per_meeting` để khôi phục hành vi cũ tuyệt đối.
+
+---
+
+## 3. Thứ tự ưu tiên (rebuild)
+
+| Thứ tự | Nhóm | Việc | Vì sao ở đây |
+|---|---|---|---|
+| **0** | **S0** | **Chẩn đoán host** (lsof / `/proc/1/fd`, đếm `docs-*`) — kiểm code đã xong ✅ | Tránh vá nhầm tầng — 15 phút, rẻ |
+| **1** | **S1** | **Vá nền tảng** (ulimit 65535 + on_disk + ít segment lớn) | Chặn cháy NGAY, mua thời gian; **bắt buộc, không phải mitigation** |
+| **2** | **S2** | **Hợp nhất (code)** `_physical()` + filter + point_id duy nhất | Lõi giải pháp fd |
+| **3** | **S3** | **Migration + XÓA collection cũ** (bắt buộc) | Không xóa cũ = chưa giải quyết gì |
+| **4** | **B1** | Worker per-collection **+ recovery scan** (độ bền) | Song song hóa + vá lỗ hổng mất job |
+| **5** | **A1** | Tokenizer tiếng Việt | "Free win", rủi ro thấp |
+| 6 | **E′** | Rotate `LLM_API_KEY` (tách khỏi E, làm sớm) | An toàn cơ bản; gắn với S1 |
+| sau | A2, C, D, E còn lại | Sparse / PageIndex / Agentic / auth-metrics | Hoãn — đo trước, gated |
+
+---
+
+## 4. Nhóm S — Dứt điểm "too many open files" (🔴🔴 BLOCKER, làm trọn gói)
+
+### S0 — Chẩn đoán trước (≈ 15 phút, không code)
+
+Các kiểm tra **code-side đã xong** (đối chiếu source 2026-06-10):
+- ✅ `QdrantClient` **là singleton** class-level ở cả `QdrantService._client` lẫn
+  `TranscriptStore._client` — Bẫy 3 loại trừ, hợp nhất collection sẽ có tác dụng.
+- ✅ `point_id` = `uuid.uuid4()` (`transcript_store.py`, `vector_store.py`) — toàn cục duy nhất,
+  **không** có nguy cơ ghi đè khi gộp; vấn đề còn lại là **idempotency** (Bẫy 4 đã viết lại).
+- ✅ Qdrant server **v1.10.0** (`docker-compose.yml`), client **1.10.1** → `scroll(order_by)` OK.
+- ⚠️ Phát hiện bug có sẵn: `get_max_sequence_id()` quét **đúng 1 trang 100 điểm**, không
+  phân trang, không filter `meeting_id` → rebuild counter sai khi meeting > 100 câu (S2d).
+
+Còn lại duy nhất việc **đo fd trên host triển khai** (xác nhận fd tập trung ở qdrant + đếm số
+collection `docs-*` thực tế cho Bẫy 5):
+```bash
+# fd mỗi process đang mở + giới hạn hiện tại, trong từng container
+docker exec <qdrant>  sh -c 'ls /proc/1/fd | wc -l; cat /proc/1/limits | grep "open files"'
+docker exec <rag_api> sh -c 'ls /proc/1/fd | wc -l; cat /proc/1/limits | grep "open files"'
+# đếm collection theo loại
+curl -s localhost:6333/collections | python -c "import sys,json;ns=[c['name'] for c in json.load(sys.stdin)['result']['collections']];print('meeting-*:',sum(n.startswith('meeting-') for n in ns),'| khác:',[n for n in ns if not n.startswith('meeting-')])"
+# nếu nghi rò ở host/docker-proxy:
+sudo lsof | awk '{print $1}' | sort | uniq -c | sort -rn | head
+```
+
+### S1 — Vá nền tảng (rẻ, làm NGAY, song song; **bắt buộc**)
+
+`docker-compose.yml` — nâng giới hạn fd cho **cả hai** service (Qdrant khuyến nghị 65535):
+```yaml
+  qdrant:
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+  rag_api:
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+```
+Tạo collection với **vector on_disk + payload on_disk + optimizer gom ít segment lớn** (xem S2 code):
+- `on_disk=True` (vector memmap) → không thường trú RAM, OS lo tiering.
+- `on_disk_payload=true` → payload (context summary) xuống disk.
+- `optimizers_config`: tăng `max_segment_size_kb`, đặt `default_segment_number` thấp, `memmap_threshold`
+  → Qdrant gom thành **ít segment lớn** thay vì nhiều segment nhỏ ⇒ **ít file hơn**.
+
+> S1 thường đã đủ chặn cháy để có thời gian làm S2–S3. Nhưng **không thay thế** hợp nhất —
+> một collection lớn vẫn có thể đụng lỗi nếu segment quá nhiều (Bẫy 2).
+
+### S2 — Hợp nhất (code): tách logical ↔ physical
+
+Giữ **hợp đồng API y nguyên** (`/transcript/meeting-{uuid}/...`, `meeting_id` suy từ tên). Chỉ đổi
+lớp lưu trữ bên trong `TranscriptStore`.
+
+**(a) Lớp resolve physical** theo `TRANSCRIPT_STORAGE_LAYOUT`:
+```python
+import hashlib
+def _physical(self, meeting_id: str) -> str:
+    layout = settings.transcript_storage_layout
+    if layout == "shared":
+        return settings.transcript_shared_collection           # vd "meeting_transcripts"
+    if layout == "sharded":
+        # KHÔNG dùng hash() built-in (bị salt theo PYTHONHASHSEED → đổi sau restart!)
+        h = int(hashlib.md5(meeting_id.encode()).hexdigest(), 16)
+        return f"meeting_bucket_{h % settings.transcript_num_shards}"
+    return f"meeting-{meeting_id}"                              # per_meeting (tương thích ngược)
+```
+
+**(b) point_id DETERMINISTIC** (Bẫy 4 — idempotency, không phải chống ghi đè):
+```python
+import uuid
+point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{meeting_id}:{sequence_id}"))
+```
+Hiện trạng: code **đã dùng `uuid4`** — toàn cục duy nhất nên gộp collection **không** ghi đè.
+Nhưng `uuid4` không deterministic ⇒ (i) migration chạy lại sẽ **nhân đôi điểm** thay vì ghi đè
+chính nó; (ii) client gửi lại cùng utterance tạo điểm trùng. `uuid5(meeting_id, sequence_id)`
+cho cả hai đường idempotent. Vẫn giữ cảnh báo: **không bao giờ** dùng `sequence_id` trần làm
+point_id (id=1 của meeting B sẽ đè id=1 của meeting A khi chung collection).
+
+**(c) `ensure_collection` (idempotent) với on_disk + optimizers** — collection dùng chung tạo 1 lần:
+```python
+from qdrant_client.models import VectorParams, Distance, OptimizersConfigDiff
+client.create_collection(
+    collection_name=phys,
+    vectors_config=VectorParams(size=384, distance=Distance.COSINE, on_disk=True),
+    on_disk_payload=True,
+    optimizers_config=OptimizersConfigDiff(
+        default_segment_number=2,        # ít segment
+        max_segment_size_kb=512_000,     # cho phép segment lớn → ít file
+        memmap_threshold_kb=20_000,
+    ),
+)
+for field, schema in (("meeting_id","keyword"),("sequence_id","integer"),("speaker","keyword")):
+    client.create_payload_index(phys, field, schema)   # best-effort, bắt buộc cho filter + order_by
+```
+
+**(d) Mọi thao tác filter theo `meeting_id`** — `search/scroll_window/find_by_seq` **đã** filter sẵn.
+Sửa thêm:
+- `upsert_point`, `delete_meeting`, mọi nơi → dùng `self._physical(meeting_id)` thay tên logic.
+- **`get_max_sequence_id(meeting_id)` — đây là BUG CÓ SẴN, sửa bất kể layout**: bản hiện tại
+  scroll **một trang `limit=100`, không phân trang, không filter `meeting_id`** rồi lấy max.
+  Hậu quả ngay với `per_meeting` hôm nay: meeting > 100 câu + Redis key hết TTL (7 ngày) ⇒
+  rebuild counter **thấp hơn thực tế** ⇒ cấp **trùng `sequence_id`**. Với `shared` còn sai thêm
+  vì quét cả meeting khác. Fix: Qdrant **không có `MAX()`** → dùng
+  `scroll(order_by=sequence_id desc, limit=1, filter=meeting_id)` — server đang chạy **v1.10.0**,
+  client **1.10.1**, `order_by` hỗ trợ từ ~v1.8 nên **không cần fallback** (chỉ cần payload index
+  integer trên `sequence_id`, đã có sẵn trong `ensure_collection`).
+
+**(e) SequenceManager**: key Redis vẫn `rag:seq:{meeting_id}` (uuid duy nhất — không đụng nhau dù chung
+collection). Rebuild gọi `get_max_sequence_id(meeting_id)` đã filter. Nhân tiện **xóa dead code
+`_ensure_collection_exists`** — chưa nơi nào gọi, và nếu gọi sẽ crash (`QdrantService` không có
+method instance `collection_exists` / `create_collection()` không tham số).
+
+**(f) Phía docs (`QdrantService`) — hệ quả Bẫy 5**: số collection docs là **client-driven**
+(form param `collection` trên `/embed/file|text` + `POST /embed/collections` tạo tùy ý, auto-create
+khi dùng lần đầu). Không đổi API, nhưng **áp cùng cấu hình `on_disk` + optimizers** vào cả hai
+đường tạo collection (`_ensure_collection` và classmethod `create_collection`) để collection docs
+mới sinh ra không tái tạo áp lực fd. Việc *gộp* docs-\* (nếu host đang có nhiều) để sau khi đo S0
+quyết — khác transcript, docs không có hợp đồng `meeting-` prefix nên gộp là việc riêng, không
+chặn S3.
+
+### S3 — Migration + XÓA collection cũ (**bắt buộc**, không phải bước phụ)
+
+> ⚠️ Đổi config sang `shared` **KHÔNG tự xóa** các `meeting-*` cũ. Nếu chỉ đổi config: ghi mới vào
+> `meeting_transcripts` **CỘNG** tất cả collection cũ vẫn còn → **nhiều file hơn trước**, lỗi không
+> biến mất. Migration kèm `delete_collection` là **điều kiện sống còn**.
+
+`scripts/migrate_collections.py` (idempotent, có `--dry-run`):
+```
+cho mỗi collection tên "meeting-*":
+    meeting_id = tên.removeprefix("meeting-")
+    scroll theo batch → re-upsert mọi điểm vào _physical(meeting_id)
+         · point_id = uuid5(meeting_id, sequence_id)   (cấp lại, toàn cục duy nhất)
+         · payload giữ nguyên (đã có meeting_id)
+    sau khi copy xong & verify count khớp → client.delete_collection("meeting-"+meeting_id)
+in ra: số collection TRƯỚC vs SAU (phải giảm về 1 với shared)
+```
+**Migration KHÔNG xóa dữ liệu** — chỉ xóa vỏ collection rỗng sau khi điểm đã sang collection chung.
+
+### 4.4. Bảy cái bẫy (đưa thẳng vào DoD, mỗi bẫy 1 kiểm tra)
+
+| # | Bẫy | Trạng thái / Kiểm tra bắt buộc |
+|---|---|---|
+| 1 | Đổi `shared` không xóa collection cũ → lỗi vẫn còn | DoD: `len(client.get_collections())` **thực sự giảm về 1** sau migration (không chỉ "tạo 100 meeting không tăng") |
+| 2 | Một collection lớn vẫn có thể đụng lỗi (RocksDB `.sst`/segment) | Làm **đồng thời** ulimit 65535 + on_disk + ít segment lớn — không coi là "optional mitigation" |
+| 3 | Chẩn nhầm tầng (fd rò ở rag_api/docker-proxy, không phải qdrant) | ✅ **Loại trừ phía code** — `QdrantClient` đã singleton (đối chiếu source). Còn lại: đo `lsof`/`/proc/1/fd` trên host để xác nhận fd tập trung ở qdrant |
+| 4 | `point_id` không deterministic → migration chạy lại **nhân đôi điểm**; client gửi lại tạo trùng | ✅ Đã xác minh code dùng `uuid4` (an toàn ghi đè). Chuyển sang `uuid5(meeting_id, sequence_id)` để migration + re-ingest idempotent; **không bao giờ** dùng `sequence_id` trần làm id |
+| 5 | Bỏ quên `docs-*`: client tự đặt `collection` + `POST /embed/collections` → fd tái phát từ phía tài liệu | ✅ Đã xác minh: số collection docs là **client-driven**. S2(f): áp on_disk + optimizers vào đường tạo của `QdrantService`; đếm số `docs-*` thực tế lúc S0, > 1 nhiều → cân nhắc gộp riêng |
+| 6 | `sharded`: `hash()` built-in bị salt; đổi `NUM_SHARDS` phải reshard | Dùng `hashlib.md5`; mặc định `shared` (sharded là YAGNI tới khi đo được collection phình) |
+| 7 | **Bug có sẵn** `get_max_sequence_id`: 1 trang 100 điểm, không filter → counter rebuild sai, **trùng `sequence_id`** | Sửa trong S2(d) bằng `scroll(order_by desc, limit=1, filter=meeting_id)`; test: meeting > 100 câu, xóa Redis key, embed tiếp → seq không trùng |
+
+### 4.5. Vì sao KHÔNG xây cold-tier (YAGNI) + lối thoát nếu cần
+
+Phép tính khăn giấy: 384-d × 4 byte ≈ 1.5 KB/vector; ~1.000 utterance/cuộc ≈ 1.5 MB vector thô,
+kể cả HNSW + payload ≈ **~10 MB/cuộc**. **10.000 cuộc ≈ vài chục GB** — vặt vãnh với SSD, và với
+`on_disk` thì RAM gần như không bị ảnh hưởng. ⇒ **gần như không bao giờ chạm ngưỡng cần archival.**
+Xây hot/warm/cold lúc này đi ngược nguyên tắc 4 ("đo trước khi mở rộng").
+
+Nếu sau này dữ liệu thật sự bùng nổ, cơ chế đúng là **Qdrant snapshot**: snapshot phần cũ ra MinIO/S3
+→ xóa khỏi instance live (lúc này mới thực sự free fd + disk) → restore khi có người mở lại cuộc đó.
+Đánh đổi: lần truy cập đầu sau archive chậm (phải restore) + thêm một tầng phức tạp. **Để dành** cho
+khi có số liệu, **đừng làm bây giờ.**
+
+### 4.6. Config nhóm S
+```ini
+TRANSCRIPT_STORAGE_LAYOUT=shared          # shared (mặc định) | sharded | per_meeting
+TRANSCRIPT_SHARED_COLLECTION=meeting_transcripts
+TRANSCRIPT_NUM_SHARDS=8                    # chỉ dùng khi layout=sharded
+QDRANT_ON_DISK=true                        # vector memmap (RAM tiering miễn phí)
+QDRANT_ON_DISK_PAYLOAD=true
+```
+
+### 4.7. DoD nhóm S (gắn 7 bẫy)
+- [ ] **S0**: đã đo fd bằng `/proc/1/fd` trên host, xác nhận fd tập trung ở qdrant; đã đếm `docs-*`.
+      *(Kiểm code: singleton ✅, point_id=uuid4 ✅, Qdrant v1.10 ✅ — xong 2026-06-10.)*
+- [ ] **S1**: `ulimits.nofile=65535` cho cả 2 service; collection tạo với `on_disk` + optimizers ít segment
+      (cả `TranscriptStore` **lẫn** `QdrantService` — S2f).
+- [ ] **S2**: `_physical()` mặc định `shared`; `point_id=uuid5` deterministic; `get_max_sequence_id`
+      filter `meeting_id` + `order_by desc limit 1` (Bẫy 7 — test meeting >100 câu, xóa Redis key,
+      embed tiếp → seq không trùng); dead code `_ensure_collection_exists` đã xóa.
+- [ ] **S3 (then chốt)**: sau migration, **số collection thực giảm về 1** (`get_collections()`); dữ liệu mọi cuộc cũ vẫn query đúng & cô lập; migration idempotent (chạy lại không nhân đôi điểm — nhờ uuid5) + `--dry-run`.
+- [ ] Tạo 100+ meeting mới → số collection **không tăng**; embed/query/context/segments/delete từng cuộc đúng.
+- [ ] `per_meeting` cho hành vi == baseline (tương thích ngược).
+- [ ] (Bẫy 5) Đã chốt số collection `docs-*` thực tế trên host; nếu nhiều → lên kế hoạch gộp docs riêng (không chặn S3).
+
+---
+
+## 5. Nhóm B1 — Worker per-collection + Recovery scan (độ bền)
+
+**Hai mục tiêu trong một lần refactor `context_worker.py`:**
+
+**(a) Song song hóa nhiều cuộc họp (giữ FIFO trong từng cuộc — D9):**
+- Thay 1 queue global bằng **dict `{physical_or_meeting: asyncio.Queue}`** + semaphore
+  `CONTEXT_WORKER_CONCURRENCY`. Mỗi key có **một** consumer task (FIFO nội bộ); nhiều key chạy song
+  song tới mức semaphore. Dọn queue idle quá `WORKER_IDLE_TTL`. `stop()` drain tất cả.
+
+**(b) Recovery scan lúc startup (vá lỗ hổng mất job — RAGFlow có, ta đang thiếu):**
+- `ContextWorker` dùng `asyncio.Queue` **in-memory** → server restart khi còn job pending ⇒ **job biến
+  mất**, utterance kẹt mãi ở `context_status="pending"`. Vì `context_status` lưu trong payload Qdrant
+  (D6) nên **khôi phục được**: trong `main.py` lifespan startup, **quét các điểm
+  `context_status ∈ {pending, processing}`** trên collection transcript và **enqueue lại**. Đây là
+  cách rẻ để có độ bền mà **không cần kéo Redis Stream** vào (giữ tinh thần tối giản).
+- Nếu sau này cần độ bền thật (at-least-once, redeliver qua restart đa worker), bài học trực tiếp từ
+  RAGFlow là **đổi `asyncio.Queue` → Redis Stream + consumer group** — để dành, không làm bây giờ.
+
+**Config**: `CONTEXT_WORKER_CONCURRENCY=4`, `CONTEXT_RECOVERY_SCAN=true`, `WORKER_IDLE_TTL=600`.
+**DoD**: 2 cuộc họp embed song song → context build đồng thời, FIFO mỗi cuộc đúng; **kill + restart
+server giữa chừng → các điểm pending được enqueue lại và chuyển `ready`** (không kẹt vĩnh viễn).
+
+---
+
+## 6. Nhóm A1 — Tokenizer tiếng Việt (🔴 cao, rủi ro thấp, "free win")
+
+**Vì sao**: `retrieval.tokenize()` cắt theo `\w+` (âm tiết) → BM25 mất khớp **từ ghép** ("ngân sách",
+"vận hành"). Segment từ ghép → khớp cụm/tên riêng chính xác hơn.
+
+**Cách làm**: trừu tượng hóa `tokenize()` theo `HYBRID_TOKENIZER`: `simple` (mặc định, zero-dep) |
+`pyvi` (`ViTokenizer.tokenize`) | `underthesea` (`word_tokenize`, nặng hơn). Load lười + cache; thiếu
+lib → log + fallback `simple`. `pyvi` đặt optional trong requirements.
+
+**Config**: `HYBRID_TOKENIZER=simple`. **DoD**: đo lại recall sau A1 (quyết định có cần A2 không);
+đổi/tắt tokenizer không lỗi.
+
+---
+
+## 7. Hoãn (gated, default off — chỉ làm khi có dữ liệu chứng minh)
+
+- **A2 — Sparse hybrid native** (`HYBRID_MODE=qdrant_sparse`): named sparse vector + Qdrant Query API
+  (prefetch dense+sparse, fusion RRF). Bắt được câu mà BM25-in-process bỏ lỡ (vì in-process chỉ
+  re-rank ứng viên vector). **Nhưng** buộc đổi `vectors_config` sang named vectors + re-index → **đo
+  recall sau A1 trước**; nếu A1 đủ tốt thì **bỏ A2**.
+- **C — PageIndex cho `docs-*`** (`DOCS_RETRIEVAL_MODE=pageindex`): cây TOC lưu thành điểm
+  `kind="toc_node"` trong cùng collection; LLM điều hướng cây. Chỉ đáng làm nếu tài liệu họp **dài &
+  có cấu trúc** — phần lớn ngắn thì bỏ. Tắt → `/query/` vector như cũ.
+- **D — Agentic RAG**: **đặt ở tầng thiết bị** (điều phối gọi `/query/` + `/query/transcript`).
+  Server chỉ thêm `/query/agentic` (endpoint mới, `AGENTIC_ENABLED=false`) **nếu** team yêu cầu agent
+  phía server. Dễ "rườm rà" & tốn LLM nhất — làm cuối.
+- **E (phần còn lại) — Hardening**: auth nội bộ (`INTERNAL_API_KEY`), rate limit, metrics
+  (`context_status=failed` rate, backlog worker), mở rộng `/health`. *(Riêng **rotate `LLM_API_KEY`**
+  tách ra làm sớm cùng S1.)*
+
+---
+
+## 8. Quyết định Kiến trúc (tiếp nối D1–D9 của [phase2.md](phase2.md))
+
+| # | Quyết định |
+|---|---|
+| **D16** | Chống vỡ fd: tách **logical (API) ≠ physical (collection)** như RAGFlow (`index/tenant` + filter `kb_id`). Nhiều cuộc → ít collection chung + filter `meeting_id`. fd tỉ lệ dung lượng (có trần), không theo số cuộc. |
+| **D17** | Layout mặc định **`shared`** (1 collection). `sharded` (hash `meeting_id`) là **YAGNI** tới khi đo được collection phình. `per_meeting` để tương thích ngược. |
+| **D18** | fd ≠ RAM: **hợp nhất** chữa fd; **`on_disk`/memmap** chữa RAM **và** cho tiering miễn phí (OS page cache). Không xây cold-tier (napkin math: 10k cuộc ≈ vài chục GB). |
+| **D19** | Gói S **làm trọn 4 bước**: S0 chẩn đoán → S1 vá nền (ulimit+on_disk+segment) → S2 hợp nhất → S3 migrate + **xóa collection cũ**. Thiếu bước nào ⇒ vẫn kẹt. |
+| **D20** | `point_id` **deterministic** (`uuid5(meeting_id, sequence_id)`) — `uuid4` hiện tại đã an toàn với gộp, nhưng uuid5 cho migration/re-ingest **idempotent**; cấm dùng `sequence_id` trần làm id. |
+| **D21** | Độ bền worker bằng **recovery scan** lúc startup (quét `pending/processing` trong payload Qdrant → enqueue lại). Redis Stream để dành nếu cần at-least-once thật. |
+| **D22** | `get_max_sequence_id` filter `meeting_id` + `scroll(order_by desc, limit 1)` — đồng thời là **bug fix** (bản cũ chỉ quét 1 trang 100 điểm, không filter). Server v1.10.0 hỗ trợ `order_by` → không cần fallback. |
+| **D23** | Tokenizer VN cắm được (`simple`/`pyvi`/`underthesea`), default `simple`, fallback an toàn. |
+
+---
+
+## 9. File tạo / sửa
+
+**Tạo**
+- `scripts/migrate_collections.py` — gộp `meeting-*` → collection chung, cấp lại `uuid5` point_id, `--dry-run`, verify số collection (S3)
+
+**Sửa**
+- `app/services/transcript_store.py` — `_physical()`; `point_id=uuid5`; `ensure_collection` on_disk + optimizers + index; **fix bug** `get_max_sequence_id(meeting_id)` → `order_by desc, limit=1, filter` (S2)
+- `app/services/transcript_service.py`, `sequence_manager.py` — gọi store theo `meeting_id`; xóa dead code `_ensure_collection_exists` (S2)
+- `app/services/vector_store.py` — áp on_disk + optimizers vào `_ensure_collection` + `create_collection` (S2f / Bẫy 5)
+- `docker-compose.yml` — `ulimits.nofile=65535` cho qdrant + rag_api (S1)
+- `app/workers/context_worker.py` — per-collection + semaphore (B1a)
+- `app/main.py` — **recovery scan** lúc startup (B1b)
+- `app/services/retrieval.py` — tokenizer cắm được (A1)
+- `app/routers/embed.py` — thay `print()` còn sót trong background task bằng logging (cleanup nhỏ, tiện tay)
+- `app/config.py`, `.env.example` — cờ mục 4.6 + A1 + B1
+- `docs/architecture.md`, `rag_server/README.md` — đồng bộ
+
+---
+
+## 10. DoD tổng
+
+- [ ] **S (then chốt)**: sau migration số collection **giảm về 1** (`get_collections()`); 100+ meeting mới không tăng collection; dữ liệu cũ query đúng & cô lập; point_id deterministic (uuid5, migration chạy lại không nhân đôi); **bug `get_max_sequence_id` đã fix** (Bẫy 7); `per_meeting` == baseline.
+- [ ] **S1**: ulimit 65535 + on_disk + ít segment lớn áp dụng đồng thời (đo fd trước/sau bằng `/proc/1/fd`).
+- [ ] **B1**: nhiều cuộc build song song, FIFO mỗi cuộc; **restart server → job pending khôi phục, không kẹt**.
+- [ ] **A1**: đổi tokenizer cải thiện khớp cụm tiếng Việt; thiếu lib không lỗi.
+- [ ] Mọi cờ TẮT + `TRANSCRIPT_STORAGE_LAYOUT=per_meeting` ⇒ hành vi == baseline hiện tại.
+- [ ] Phase 1/2 + 4 endpoint transcript + `/docs` nguyên vẹn; không phát sinh endpoint lạ.
+
+---
+
+## 11. Câu hỏi mở (cập nhật 2026-06-10 — 2 câu đã đóng nhờ đối chiếu code)
+
+1. **Số cuộc họp tích lũy dự kiến?** → khẳng định `shared` đủ (gần như chắc chắn) hay cần `sharded`.
+2. **`docs-*` hiện có bao nhiêu collection trên host triển khai?** (Bẫy 5) — code đã xác nhận
+   client *có thể* tạo tùy ý; số thực tế phải đếm lúc S0. S2(f) áp on_disk cho mọi collection docs
+   mới bất kể câu trả lời.
+3. ~~Version Qdrant server + qdrant-client?~~ ✅ **Đã đóng**: server v1.10.0, client 1.10.1 →
+   `scroll order_by` hỗ trợ, bỏ fallback.
+4. ~~`QdrantClient` đang singleton chưa?~~ ✅ **Đã đóng**: singleton class-level ở cả hai store.
+5. **A2 có cần không?** → đo recall sau A1 rồi quyết.
+6. **Đa tenant?** → nếu nhiều tổ chức, cân nhắc thêm `tenant_id` vào tên collection vật lý (RAGFlow-style).
+
+---
+
+*Hết tài liệu Phase 3 (rebuild). Nhóm S là blocker — triển khai **trọn 4 bước S0→S3**, thiếu bước nào
+cũng còn kẹt. Mọi tính năng khác giữ nguyên tắc bất biến mục 2: gated, default TẮT, tắt = baseline.
+Mọi sai khác so với Design Decisions (mục 8, tiếp nối D1–D9 của phase2.md) phải xác nhận lại.*

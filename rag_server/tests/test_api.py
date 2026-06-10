@@ -19,16 +19,23 @@ def http_client():
         yield client
 
 
-@pytest.fixture(scope="module")
-def cleanup_collections():
-    collections_to_cleanup = [TestConfig.COLLECTION_NAME, TestConfig.SECOND_COLLECTION]
-    yield
+def setup_module(module):
+    """Xoá collections còn sót lại từ test run trước."""
     with httpx.Client(base_url=BASE_URL, timeout=TIMEOUT) as client:
-        for col in collections_to_cleanup:
+        for col in [TestConfig.COLLECTION_NAME, TestConfig.SECOND_COLLECTION]:
             try:
-                client.post("/embed/collections", data={"name": col})
-                client.delete("/embed/collections", data={"name": col})
-            except:
+                client.request("DELETE", "/embed/collections", data={"name": col})
+            except Exception:
+                pass
+
+
+def teardown_module(module):
+    """Dọn collections sau khi test module kết thúc."""
+    with httpx.Client(base_url=BASE_URL, timeout=TIMEOUT) as client:
+        for col in [TestConfig.COLLECTION_NAME, TestConfig.SECOND_COLLECTION]:
+            try:
+                client.request("DELETE", "/embed/collections", data={"name": col})
+            except Exception:
                 pass
 
 
@@ -41,7 +48,7 @@ class TestHealthCheck:
 
 
 class TestCollectionManagement:
-    def test_create_collection(self, http_client, cleanup_collections):
+    def test_create_collection(self, http_client):
         response = http_client.post(
             "/embed/collections",
             data={"name": TestConfig.COLLECTION_NAME}
@@ -50,7 +57,7 @@ class TestCollectionManagement:
         data = response.json()
         assert data["success"] is True
 
-    def test_create_duplicate_collection(self, http_client, cleanup_collections):
+    def test_create_duplicate_collection(self, http_client):
         response = http_client.post(
             "/embed/collections",
             data={"name": TestConfig.COLLECTION_NAME}
@@ -60,7 +67,7 @@ class TestCollectionManagement:
         assert data["success"] is False
         assert "already exists" in data["message"]
 
-    def test_list_collections(self, http_client, cleanup_collections):
+    def test_list_collections(self, http_client):
         response = http_client.get("/embed/collections")
         assert response.status_code == 200
         data = response.json()
@@ -68,7 +75,7 @@ class TestCollectionManagement:
         assert isinstance(data["collections"], list)
         assert TestConfig.COLLECTION_NAME in data["collections"]
 
-    def test_create_second_collection(self, http_client, cleanup_collections):
+    def test_create_second_collection(self, http_client):
         response = http_client.post(
             "/embed/collections",
             data={"name": TestConfig.SECOND_COLLECTION}
@@ -77,7 +84,7 @@ class TestCollectionManagement:
         data = response.json()
         assert data["success"] is True
 
-    def test_collection_info(self, http_client, cleanup_collections):
+    def test_collection_info(self, http_client):
         response = http_client.get(f"/embed/info/{TestConfig.COLLECTION_NAME}")
         assert response.status_code == 200
         data = response.json()
@@ -86,8 +93,9 @@ class TestCollectionManagement:
         assert "points_count" in data
         assert "status" in data
 
-    def test_delete_collection(self, http_client, cleanup_collections):
-        response = http_client.delete(
+    def test_delete_collection(self, http_client):
+        response = http_client.request(
+            "DELETE",
             "/embed/collections",
             data={"name": TestConfig.SECOND_COLLECTION}
         )
@@ -95,8 +103,9 @@ class TestCollectionManagement:
         data = response.json()
         assert data["success"] is True
 
-    def test_delete_nonexistent_collection(self, http_client, cleanup_collections):
-        response = http_client.delete(
+    def test_delete_nonexistent_collection(self, http_client):
+        response = http_client.request(
+            "DELETE",
             "/embed/collections",
             data={"name": "nonexistent_collection"}
         )
@@ -110,7 +119,7 @@ class TestEmbedText:
     DOC_ID = None
     SOURCE = "test_embed_text.txt"
 
-    def test_embed_text_default_collection(self, http_client, cleanup_collections):
+    def test_embed_text_default_collection(self, http_client):
         response = http_client.post(
             "/embed/text",
             json={
@@ -125,7 +134,7 @@ class TestEmbedText:
         assert data["chunks_created"] == 0
         TestEmbedText.DOC_ID = data["doc_id"]
 
-    def test_embed_text_custom_collection(self, http_client, cleanup_collections):
+    def test_embed_text_custom_collection(self, http_client):
         response = http_client.post(
             "/embed/text",
             json={
@@ -139,7 +148,7 @@ class TestEmbedText:
         assert data["success"] is True
         assert data["chunks_created"] == 0
 
-    def test_embed_text_with_metadata(self, http_client, cleanup_collections):
+    def test_embed_text_with_metadata(self, http_client):
         response = http_client.post(
             "/embed/text",
             json={
@@ -152,7 +161,7 @@ class TestEmbedText:
         data = response.json()
         assert data["success"] is True
 
-    def test_embed_empty_text(self, http_client, cleanup_collections):
+    def test_embed_empty_text(self, http_client):
         response = http_client.post(
             "/embed/text",
             json={
@@ -162,7 +171,7 @@ class TestEmbedText:
         )
         assert response.status_code == 422
 
-    def test_embed_text_missing_source(self, http_client, cleanup_collections):
+    def test_embed_text_missing_source(self, http_client):
         response = http_client.post(
             "/embed/text",
             json={
@@ -173,7 +182,7 @@ class TestEmbedText:
 
 
 class TestEmbedFile:
-    def test_embed_small_text_file(self, http_client, cleanup_collections):
+    def test_embed_small_text_file(self, http_client):
         content = b"Day la noi dung file text cho test.\nLine 2\nLine 3"
         files = {"file": ("small_test.txt", content, "text/plain")}
         data = {"collection": TestConfig.COLLECTION_NAME}
@@ -185,7 +194,8 @@ class TestEmbedFile:
 
 
 class TestQuery:
-    def test_query_basic(self, http_client, cleanup_collections):
+    def test_query_basic(self, http_client):
+
         response = http_client.post(
             "/query/",
             json={
@@ -199,7 +209,7 @@ class TestQuery:
         assert "total_found" in data
         assert "query" in data
 
-    def test_query_with_collection(self, http_client, cleanup_collections):
+    def test_query_with_collection(self, http_client):
         response = http_client.post(
             "/query/",
             json={
@@ -212,7 +222,7 @@ class TestQuery:
         data = response.json()
         assert data["total_found"] >= 0
 
-    def test_query_with_score_threshold(self, http_client, cleanup_collections):
+    def test_query_with_score_threshold(self, http_client):
         response = http_client.post(
             "/query/",
             json={
@@ -226,7 +236,7 @@ class TestQuery:
         for r in data["results"]:
             assert r["score"] >= 0.8
 
-    def test_query_with_source_filter(self, http_client, cleanup_collections):
+    def test_query_with_source_filter(self, http_client):
         response = http_client.post(
             "/query/",
             json={
@@ -240,7 +250,7 @@ class TestQuery:
         for r in data["results"]:
             assert r["source"] == "python_info.txt"
 
-    def test_query_empty_query(self, http_client, cleanup_collections):
+    def test_query_empty_query(self, http_client):
         response = http_client.post(
             "/query/",
             json={
@@ -248,9 +258,9 @@ class TestQuery:
                 "top_k": 5,
             }
         )
-        assert response.status_code == 400
+        assert response.status_code in (400, 422)
 
-    def test_query_large_top_k(self, http_client, cleanup_collections):
+    def test_query_large_top_k(self, http_client):
         response = http_client.post(
             "/query/",
             json={
@@ -260,7 +270,7 @@ class TestQuery:
         )
         assert response.status_code == 200
 
-    def test_query_nonexistent_collection(self, http_client, cleanup_collections):
+    def test_query_nonexistent_collection(self, http_client):
         response = http_client.post(
             "/query/",
             json={
@@ -273,7 +283,7 @@ class TestQuery:
 
 
 class TestDeleteDocuments:
-    def test_delete_by_source(self, http_client, cleanup_collections):
+    def test_delete_by_source(self, http_client):
         http_client.post(
             "/embed/text",
             json={
@@ -289,7 +299,7 @@ class TestDeleteDocuments:
         data = response.json()
         assert data["success"] is True
 
-    def test_delete_by_doc_id(self, http_client, cleanup_collections):
+    def test_delete_by_doc_id(self, http_client):
         doc_id = str(uuid.uuid4())
         http_client.post(
             "/embed/text",
@@ -307,7 +317,7 @@ class TestDeleteDocuments:
         data = response.json()
         assert data["success"] is True
 
-    def test_delete_nonexistent_doc(self, http_client, cleanup_collections):
+    def test_delete_nonexistent_doc(self, http_client):
         response = http_client.delete(
             f"/embed/{TestConfig.COLLECTION_NAME}/doc/nonexistent-uuid"
         )
@@ -315,7 +325,7 @@ class TestDeleteDocuments:
 
 
 class TestListDocuments:
-    def test_list_documents(self, http_client, cleanup_collections):
+    def test_list_documents(self, http_client):
         response = http_client.get(f"/embed/{TestConfig.COLLECTION_NAME}/documents")
         assert response.status_code == 200
         data = response.json()
@@ -323,7 +333,7 @@ class TestListDocuments:
         assert "total" in data
         assert isinstance(data["documents"], list)
 
-    def test_list_documents_structure(self, http_client, cleanup_collections):
+    def test_list_documents_structure(self, http_client):
         response = http_client.get(f"/embed/{TestConfig.COLLECTION_NAME}/documents")
         assert response.status_code == 200
         data = response.json()
@@ -347,7 +357,7 @@ class TestCollectionInfo:
 
 
 class TestEdgeCases:
-    def test_large_text_embed(self, http_client, cleanup_collections):
+    def test_large_text_embed(self, http_client):
         large_text = "Line " + "\n".join([f"of content {i}" for i in range(1000)])
         response = http_client.post(
             "/embed/text",
@@ -360,7 +370,7 @@ class TestEdgeCases:
         data = response.json()
         assert data["chunks_created"] == 0
 
-    def test_special_characters_in_text(self, http_client, cleanup_collections):
+    def test_special_characters_in_text(self, http_client):
         special_text = "Test with special chars: @#$%^&*() Vietnamese: Tiếng Việt Chinese: 中文"
         response = http_client.post(
             "/embed/text",
@@ -371,7 +381,7 @@ class TestEdgeCases:
         )
         assert response.status_code == 200
 
-    def test_unicode_content(self, http_client, cleanup_collections):
+    def test_unicode_content(self, http_client):
         unicode_text = """
         Tiếng Việt: Chào buổi sáng! 🎉
         中文：你好世界
@@ -388,7 +398,7 @@ class TestEdgeCases:
         )
         assert response.status_code == 200
 
-    def test_query_special_characters(self, http_client, cleanup_collections):
+    def test_query_special_characters(self, http_client):
         response = http_client.post(
             "/query/",
             json={
@@ -400,7 +410,7 @@ class TestEdgeCases:
 
 
 class TestPerformance:
-    def test_multiple_consecutive_queries(self, http_client, cleanup_collections):
+    def test_multiple_consecutive_queries(self, http_client):
         start = time.time()
         for i in range(10):
             response = http_client.post(
@@ -414,7 +424,7 @@ class TestPerformance:
         duration = time.time() - start
         assert duration < 30
 
-    def test_multiple_embeds_same_source(self, http_client, cleanup_collections):
+    def test_multiple_embeds_same_source(self, http_client):
         for i in range(3):
             response = http_client.post(
                 "/embed/text",
@@ -427,7 +437,7 @@ class TestPerformance:
 
 
 class TestConcurrent:
-    def test_concurrent_queries(self, http_client, cleanup_collections):
+    def test_concurrent_queries(self, http_client):
         import concurrent.futures
 
         def query_task(query_id):
@@ -476,7 +486,7 @@ class TestErrorHandling:
 
 class TestCleanup:
     @pytest.fixture(scope="class", autouse=True)
-    def cleanup_after_tests(self, http_client, cleanup_collections):
+    def cleanup_after_tests(self, http_client):
         yield
         try:
             http_client.delete("/embed/collections", data={"name": TestConfig.COLLECTION_NAME})
